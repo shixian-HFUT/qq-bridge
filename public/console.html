@@ -1790,7 +1790,7 @@ button:active:not(:disabled) {
       </div>
       <div id="connectionAlert" class="connection-alert" role="alert" hidden></div>
       <div id="overviewSummary" class="overview-summary span-all" data-page="overview">
-        <div class="metric"><span>DSH 连接</span><strong id="metricDsh">连接中</strong><small id="metricDshHint">等待服务响应</small></div>
+        <div class="metric"><span id="metricBackendLabel">模型后端</span><strong id="metricDsh">连接中</strong><small id="metricDshHint">等待服务响应</small></div>
         <div class="metric"><span>SnowLuma 上游</span><strong id="metricSnowluma">读取中</strong><small id="metricSnowlumaHint">等待网关健康上报</small></div>
         <div class="metric"><span>当前运行模式</span><strong id="metricMode">—</strong><small id="metricRole">正在读取角色</small></div>
         <button class="metric metric-link" data-view="sessions"><span>已建立会话</span><strong id="metricSessions">—</strong><small>查看会话映射 <span aria-hidden="true">↗</span></small></button>
@@ -4366,11 +4366,13 @@ document.querySelector('.skip-link').addEventListener('click', event => {
 });
 function updateOverview(status, modeLabel) {
   const connection = document.getElementById('statusText');
-  connection.textContent = status.dshReady ? 'DSH 已连接' : 'DSH 未连接';
+  const backendLabel = status.runtimeBackend === 'pi' ? 'Pi' : 'DSH';
+  document.getElementById('metricBackendLabel').textContent = backendLabel + ' 连接';
+  connection.textContent = backendLabel + (status.dshReady ? ' 已连接' : ' 未连接');
   connection.className = 'status-badge ' + (status.dshReady ? 'online' : 'offline');
   document.getElementById('metricDsh').textContent = status.dshReady ? '已连接' : '未连接';
   document.getElementById('metricDsh').className = status.dshReady ? 'ok' : 'err';
-  document.getElementById('metricDshHint').textContent = status.dshReady ? '桥接状态已同步' : '请检查 DSH 是否运行';
+  document.getElementById('metricDshHint').textContent = status.dshReady ? '桥接状态已同步' : '请检查 ' + backendLabel + ' 是否运行';
   renderSnowlumaHealth(status.snowluma);
   document.getElementById('metricMode').textContent = modeLabel.replace('模式', '');
   document.getElementById('metricRole').textContent = '角色 · ' + (status.role || '默认人格');

@@ -5,6 +5,9 @@ node_modules/
 # Runtime state and local config (never publish)
 state/
 config.json
+.env
+.env.*
+!.env.example
 *.log
 *.bak
 *.bak-*

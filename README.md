@@ -2,6 +2,8 @@
 
 **English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
 
+> 本 fork 新增可选的 **Pi 后端与回复流程优化**：由桥接进程直接运行 Pi Agent，在成功发送并确认已读后结束本轮，省去发送后的收尾模型调用；后台观察新消息，避免空闲长轮询。DSH 后端仍保留为默认值。迁移、配置、边界和离线复现步骤见 [Pi 后端说明](docs/guides/PI_BACKEND.md)。
+
 > 🗂️ 文档索引（全部文档一句话说明 + 是否仍然有效）见 **[docs/README.md](docs/README.md)**；仓库目录/脚本命名约定见 **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**。
 >
 > 🔒 QQ 会话的权限边界与安全承诺见 **[RULES.md](RULES.md)**。

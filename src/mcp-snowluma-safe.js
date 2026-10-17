@@ -232,6 +232,19 @@ const disabledTools = [];
       disabledTools.push(`${name}(${flag})`);
       return undefined;
     }
+    // Preserve validators and required/optional fields; shorten only repeated
+    // parameter documentation. All QQ tools use the same key/token convention.
+    if (typeof rest[0] === 'string' && rest[1] && typeof rest[1] === 'object') {
+      const shape = { ...rest[1] };
+      const common = {
+        key: '会话key：group:群号/private:QQ号',
+        token: '唤醒提示中的会话令牌',
+      };
+      for (const [field, description] of Object.entries(common)) {
+        if (typeof shape[field]?.describe === 'function') shape[field] = shape[field].describe(description);
+      }
+      rest[1] = shape;
+    }
     return registerTool(name, ...rest);
   };
 }
@@ -477,7 +490,7 @@ server.tool(
 
 server.tool(
   'qq_mark_read',
-  '将指定会话已查看的未读消息标记为已读。throughSeq 使用最近读取结果的 readThroughSeq，避免清除读取后才到达的新消息；省略 throughSeq 会按旧行为清空当前全部未读，因此推荐始终带上水位。注意：每次设置潜水/下一次唤醒前，桥接要求先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可 mark_read 收尾沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与也可直接 mark_read 收尾；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '确认已查看的消息，throughSeq仅用返回的readThroughSeq；不要省略水位。后台观察模式成功后直接结束，不再wait/查状态。前台模式潜水前须完成messages+timeoutMs=300000观察，明确结束语可豁免。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -495,7 +508,7 @@ server.tool(
 
 server.tool(
   'qq_set_wake_config',
-  '设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：每次设置潜水/下一次唤醒前需先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可设置并沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与可直接设置并沉睡；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '设置活跃/潜水、时间及唤醒条件；缺省字段保留原值。throughSeq可同时确认已读。后台观察模式成功后直接结束；前台模式潜水前须messages+timeoutMs=300000观察，无人说话或已看新消息且不参与可收尾，参与回复则重新观察，明确结束语可豁免。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -577,13 +590,14 @@ server.tool(
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条'),
+    throughSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional().describe('成功发送后同时确认已读：仅用已展示的readThroughSeq；后台模式turnComplete=true后直接结束'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
     gapMode: z.enum(['auto', 'fixed', 'byLength']).optional().describe('auto=桥接随机；fixed=固定间隔；byLength=按字数计算'),
     gapMs: z.number().optional().describe('fixed 模式下的统一间隔（毫秒）'),
     gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
+  async ({ key, token, messages, throughSeq, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -605,7 +619,7 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
-        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps }),
+        body: JSON.stringify({ key, messages: finalMessages, throughSeq, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
