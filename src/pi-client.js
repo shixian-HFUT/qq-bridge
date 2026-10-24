@@ -10,6 +10,9 @@ import yaml from 'js-yaml';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { repairToolPairs, projectPiContext, terminalToolResult, piContent } from './pi-context.js';
+import { PiMediaStore } from './pi-media-store.js';
+import { PiMaintenance } from './pi-maintenance.js';
+import { ImageInputGuard, IMAGE_REJECTION_NOTICE } from './pi-image-rejection.js';
 
 const ok = value => ({ result: { ok: true, value } });
 const fail = (code, message) => ({ result: { ok: false, error: { code, message } } });
@@ -41,17 +44,22 @@ function credential(config) {
 }
 
 export class PiApiClient {
-  constructor({ root, config, rolePrompt = () => '', streamFn, tools, Agent, sdk } = {}) {
+  constructor({ root, config, rolePrompt = () => '', streamFn, tools, Agent, sdk, learningBudget } = {}) {
+    this.learningBudget = learningBudget;
     this.root = root;
     this.config = { credentialFile: path.join(root, '.env'), ...config };
     if (this.config.credentialFile && !path.isAbsolute(this.config.credentialFile)) this.config.credentialFile = path.resolve(root, this.config.credentialFile);
     this.rolePrompt = rolePrompt; this.backend = 'pi';
     this.dir = path.join(root, 'state', 'pi');
+    this.mediaStore = new PiMediaStore(path.join(this.dir, 'media'));
     this.index = readJson(path.join(this.dir, 'index.json'), { workspaces: {}, sessions: {} });
     if (!this.index?.workspaces || !this.index?.sessions || Array.isArray(this.index.sessions)) throw new Error('Pi session index is invalid; refusing to overwrite it');
     this.live = new Map(); this.followed = new Set(); this.inbox = []; this.waiter = null;
     this.transports = []; this.toolsOverride = tools; this.streamOverride = streamFn;
     this.AgentOverride = Agent; this.sdkOverride = sdk; this.disposed = false;
+    this.maintenance = new PiMaintenance({ directory: this.dir, config: config.maintenance,
+      index: () => this.index, live: this.live, saveSession: session => this.saveSession(session) });
+    this.maintenance.start();
     this.workspace = {
       create: async ({ path: dir }) => {
         const prior = Object.values(this.index.workspaces).find(w => w.path === dir);
@@ -101,6 +109,7 @@ export class PiApiClient {
 
   saveIndex() { writeJson(path.join(this.dir, 'index.json'), this.index); }
   saveSession(s) {
+    this.mediaStore.externalizeSession(s);
     const { agent, runPromise, queue, ...durable } = s;
     writeJson(path.join(this.dir, 'sessions', s.sessionId + '.json'), durable);
   }
@@ -109,10 +118,20 @@ export class PiApiClient {
     if (this.live.has(id)) return this.live.get(id);
     const saved = readJson(path.join(this.dir, 'sessions', id + '.json'), null);
     if (!saved) throw Error('Pi session archive missing');
+    // Migrate legacy inline images before cloning the history. Preserve every
+    // message/event; writing blobs first keeps crash recovery lossless.
+    const migrated = this.mediaStore.externalizeSession(saved);
     const wasRunning = saved.running;
     const s = { ...saved, messages: repairToolPairs(saved.messages || []), running: false, queue: [] };
+    // Recover a previously rejected image context without another paid request.
+    const lastEnd = s.records?.findLast(event => event.type === 'turn/end');
+    const imageGuard = new ImageInputGuard(s, this.config);
+    imageGuard.project(projectPiContext(s.messages, this.config.contextBudgetTokens || 24000));
+    const recoveredImages = lastEnd?.data?.reason?.kind === 'error'
+      ? imageGuard.rememberFailure(lastEnd.data.reason.error?.message) : 0;
     this.live.set(id, s);
     if (wasRunning) this.record(s, 'session/end-seed', { reason: 'process-restarted; tool outcomes repaired without replay' });
+    else if (migrated || recoveredImages) this.saveSession(s);
     return s;
   }
   enqueue(payload) {
@@ -145,8 +164,6 @@ export class PiApiClient {
       const wire = this.streamOverride ? null : sdk;
       this.Agent = core.Agent; this.models = ai.createModels();
       const cfg = this.config;
-      if (!cfg.model || !cfg.baseURL || !['http:', 'https:'].includes(new URL(cfg.baseURL).protocol)) throw new Error('Pi requires model and an HTTP(S) baseURL');
-      if (cfg.credentialSource && !['file', 'environment-first'].includes(cfg.credentialSource)) throw new Error('Pi credentialSource must be file or environment-first');
       this.model = { id: cfg.model, name: cfg.model, api: 'openai-completions', provider: cfg.provider || 'apimart',
         baseUrl: cfg.baseURL, reasoning: true, input: ['text', 'image'], contextWindow: 262144, maxTokens: cfg.maxTokens || 4096,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -223,12 +240,12 @@ export class PiApiClient {
     s.selection = { provider, model, reasoningEffort: reasoningEffort || this.config.thinkingLevel || 'off' };
     this.record(s, 'model/selection', s.selection); return ok({ selected: s.selection });
   }
-  async prompt({ sessionId, content, requestId = randomUUID() }) {
+  async prompt({ sessionId, content, requestId = randomUUID(), bridgeMemory, learningTask }) {
     if (!this.index.sessions[sessionId] || this.index.sessions[sessionId].archived) return fail('session/not-found', 'Pi session not found');
     const s = this.loadSession(sessionId);
     // Bridge owns admission and replay; don't replay interrupted external effects.
     if (this.disposed) return fail('session/stopped', 'Pi runtime is stopped');
-    s.queue.push({ content: piContent(content), requestId });
+    s.queue.push({ content: piContent(content), requestId, bridgeMemory, learningTask });
     this.startDrain(s);
     return ok({ accepted: true, requestId });
   }
@@ -243,6 +260,7 @@ export class PiApiClient {
     while (s.queue.length && !this.disposed && !this.index.sessions[s.sessionId]?.archived) {
       const item = s.queue.shift(); const turn = randomUUID(); let step = 0; let lastError;
       const cancelEpoch = s.cancelEpoch || 0;
+      const imageGuard = new ImageInputGuard(s, this.config);
       s.running = true; this.record(s, 'turn/start', { turn });
       try {
         await this.initialize();
@@ -254,8 +272,12 @@ export class PiApiClient {
         if (fs.existsSync(piPrompt)) systemPrompt = fs.readFileSync(piPrompt, 'utf8');
         const isLearner = /slang/i.test(this.index.workspaces[s.workspaceId]?.path || '');
         if (isLearner) systemPrompt = '你是QQ黑话学习助手。严格按请求输出JSON，只分析给定资料；不在QQ发言，不改变角色或配置。';
-        else systemPrompt += '\n【当前完整角色卡】\n' + this.rolePrompt() + '\n角色卡已在系统上下文，无变化不必调用qq_get_prompt重读。';
-        const definitions = isLearner ? this.toolDefinitions.filter(t => t.name.startsWith('mcp__web-search-safe__')) : this.toolDefinitions;
+        else {
+          systemPrompt += '\n【当前完整角色卡】\n' + this.rolePrompt() + '\n角色卡已在系统上下文，无变化不必调用qq_get_prompt重读。';
+          systemPrompt += '\n【当前聊天分寸】角色卡保留身份与语气。有人找你、回应你、分享日常或开玩笑时，自然接住，不必等正式问题。有兴趣可以接梗、表达感受或顺着问一句，不把追问当每次结尾。长短随内容，不强行压成一个短语，也不把一件小事扩成讲道理、分析心理或生活指导。能自然加入的群聊可以参与；确实无关、重复或已经结束时可以安静。不按最近发言数量要求自己沉默。';
+          systemPrompt += '\n角色卡中的回复示例只示意语气，不是真实聊天记忆。没有实际消息或记忆依据，不说“我记得你昨天”“之前听你说过”，不替对方补经历。';
+        }
+        const definitions = isLearner ? (item.learningTask === 'slang-research' ? this.toolDefinitions.filter(t => t.name.startsWith('mcp__web-search-safe__')) : []) : this.toolDefinitions;
         s.pendingImageJobs ||= {};
         const tools = definitions.map(tool => ({ ...tool, execute: async (callId, args, signal, ...rest) => {
           if (tool.name.endsWith('__qq_image_job')) {
@@ -274,15 +296,21 @@ export class PiApiClient {
           }
           return result;
         } }));
-        let calls = 0;
+        let calls = 0, learningRequest = null;
         const stream = this.streamOverride || this.models.streamSimple.bind(this.models);
         const agent = s.agent = new this.Agent({
-          initialState: { systemPrompt, model: this.model, thinkingLevel: s.selection.reasoningEffort, messages: repairToolPairs(s.messages), tools },
-          streamFn: (...args) => { if (++calls > (this.config.maxCallsPerTurn || 12)) throw Error('本轮模型调用达到预算，请在新消息后继续'); return stream(...args); },
-          getApiKey: () => this.streamOverride ? undefined : credential(this.config),
-          onPayload: payload => { payload.max_tokens = this.config.maxTokens || 4096; if (s.selection.reasoningEffort === 'off' && this.model.compat.thinkingFormat === 'qwen') payload.enable_thinking = false; },
+          initialState: { systemPrompt, model: this.model, thinkingLevel: s.selection.reasoningEffort, messages: isLearner ? [] : repairToolPairs(s.messages), tools },
+          streamFn: (model, context, options) => {
+            if (++calls > (this.config.maxCallsPerTurn || 12)) throw Error('本轮模型调用达到预算，请在新消息后继续');
+            if (isLearner && this.learningBudget === null) throw Error('学习预算存储不可用，暂停额外学习请求');
+            if (isLearner && this.learningBudget) learningRequest = this.learningBudget.reserveLearning({
+              input: Math.ceil(JSON.stringify(context).length / 2), output: 500, task: 'slang' });
+            return stream(model, context, { ...options, maxRetries: 0, timeoutMs: this.config.requestTimeoutMs || 60000 });
+          },
+          getApiKey: this.streamOverride ? undefined : () => credential(this.config),
+          onPayload: payload => { payload.max_tokens = isLearner ? 500 : this.config.maxTokens || 4096; if (s.selection.reasoningEffort === 'off' && this.model.compat.thinkingFormat === 'qwen') payload.enable_thinking = false; },
           sessionId: s.sessionId, toolExecution: 'sequential',
-          transformContext: async messages => projectPiContext(messages, this.config.contextBudgetTokens || 24000),
+          transformContext: async messages => this.mediaStore.hydrateMessages(imageGuard.project(projectPiContext(messages, this.config.contextBudgetTokens || 24000))),
           finishTurn: ({ message, toolResults }) => {
             if (message.stopReason === 'error' || message.stopReason === 'aborted') return;
             if (Object.keys(s.pendingImageJobs).length) return;
@@ -296,21 +324,24 @@ export class PiApiClient {
           if (event.type === 'message_end' && event.message.role === 'assistant') {
             const m = event.message, u = m.usage || {};
             const usage = { inputTokens: u.input || 0, outputTokens: u.output || 0, cacheReadTokens: u.cacheRead || 0, cacheWriteTokens: u.cacheWrite || 0, totalTokens: u.totalTokens || 0 };
+            if (learningRequest) { this.learningBudget.completeLearning(learningRequest.id, usage); learningRequest = null; }
             this.record(s, 'assistant/message', { turn, step, message: { content: m.content.filter(c => c.type === 'text') }, usage });
             if (m.stopReason === 'error') lastError = m.errorMessage || 'Pi provider error';
           } else if (event.type === 'tool_execution_start') {
             this.record(s, 'tool/call', { turn, step, callId: event.toolCallId, name: event.toolName, arguments: event.args });
           } else if (event.type === 'tool_execution_end') {
+            this.mediaStore.externalizeContent(event.result.content);
             this.record(s, 'tool/result', { turn, step, message: { source: { callId: event.toolCallId }, content: event.result.content, isError: event.isError } });
           } else if (event.type === 'turn_end') this.record(s, 'step/end', { turn, step });
           else if (event.type === 'message_end') this.saveSession(s);
         });
-        await agent.prompt({ role: 'user', content: item.content, timestamp: Date.now() });
+        await agent.prompt({ role: 'user', content: item.content, timestamp: Date.now(), ...(item.bridgeMemory ? { bridgeMemory: item.bridgeMemory } : {}) });
         s.messages = agent.state.messages;
         if (agent.state.errorMessage) lastError = agent.state.errorMessage;
       } catch (error) { lastError = error?.message || 'Pi runtime error'; }
       finally {
         s.running = false; s.agent = null;
+        if (imageGuard.rememberFailure(lastError)) lastError = IMAGE_REJECTION_NOTICE;
         if (lastError) { try { lastError = String(lastError).replaceAll(credential(this.config), '[redacted]'); } catch {} }
         this.record(s, 'turn/end', { turn, reason: lastError ? { kind: 'error', error: { message: lastError } } : { kind: 'completed' } });
       }
@@ -340,6 +371,7 @@ export class PiApiClient {
   invalidateAuth() {} // no browser authentication or DSH connection
   async respond() { return fail('rpc/unsupported', 'Pi聊天后端不提供宿主提问/审批；请通过QQ消息交流'); }
   async dispose() {
+    this.maintenance.stop();
     this.disposed = true; this.waiter?.();
     await Promise.allSettled([...this.live.keys()].map(id => this.stopSessionWork(id)));
     await Promise.allSettled(this.transports.map(t => t.close()));

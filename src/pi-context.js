@@ -43,20 +43,33 @@ function estimate(value) {
 export function projectPiContext(messages, budgetTokens = 24000) {
   const system = messages.filter(m => m.role === 'system');
   const history = repairToolPairs(messages);
+  const snapshot = [...history].reverse().find(m => m.role === 'user' && m.bridgeMemory)?.bridgeMemory;
   const groups = [];
   for (const m of history) {
     if (m.role === 'user' || !groups.length) groups.push([]);
     groups.at(-1).push(m);
   }
-  let used = estimate(system);
+  const withoutMetadata = m => { const { bridgeMemory, ...visible } = m; return visible; };
+  let used = estimate(system) + (snapshot ? estimate(snapshot.text) : 0);
   const kept = [];
   for (let i = groups.length - 1; i >= 0; i--) {
-    const n = estimate(groups[i]);
+    const n = estimate(groups[i].map(withoutMetadata));
     if (kept.length && used + n > budgetTokens) break;
     kept.unshift(groups[i]); used += n;
   }
   // Never split a user turn through a tool-call/result pair to fit a budget.
-  return [...system, ...kept.flat()];
+  const retained = kept.flat();
+  // Snapshots are durable metadata, never duplicated into archived user text.
+  // Keep one copy of the latest visible version. Cutting older turns or a
+  // restart cannot turn a session-local "already sent" flag into memory loss.
+  let target = retained.findIndex(m => m.role === 'user' && m.bridgeMemory?.version === snapshot?.version);
+  if (target < 0) target = retained.findIndex(m => m.role === 'user');
+  const projected = retained.map((m, i) => {
+    const visible = withoutMetadata(m);
+    if (snapshot?.text && i === target) visible.content = [{ type: 'text', text: `【当前记忆快照 ${snapshot.version}】\n${snapshot.text}` }, ...visible.content];
+    return visible;
+  });
+  return [...system, ...projected];
 }
 
 export function terminalToolResult(name, result, args = {}) {
@@ -65,7 +78,7 @@ export function terminalToolResult(name, result, args = {}) {
   let data;
   for (const text of texts) { try { data = JSON.parse(text); break; } catch {} }
   if (!data || data.ok !== true) return false;
-  if (name.endsWith('__qq_send_message')) return data.turnComplete === true && data.failed === 0;
+  if (name.endsWith('__qq_send_message') || name.endsWith('__qq_send_image')) return data.turnComplete === true && data.failed === 0;
   if (name.endsWith('__qq_mark_read') || name.endsWith('__qq_set_wake_config')) {
     return Number.isSafeInteger(args.throughSeq) && data.unreadCount === 0;
   }

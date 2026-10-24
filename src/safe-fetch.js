@@ -12,6 +12,41 @@ import https from 'node:https';
 import { StringDecoder } from 'node:string_decoder';
 
 const dnsLookup = dns.promises.lookup;
+let allowFakeDnsFallback = false;
+const publicDnsCache = new Map();
+
+// Opt-in for a deployment using a TUN resolver. Virtual addresses are never
+// contacted: resolve the public name over authenticated HTTPS, then pin a
+// separately validated public IP through the usual transport.
+export function configureSafeDns({ fakeDnsFallback = false } = {}) {
+  allowFakeDnsFallback = fakeDnsFallback === true;
+  publicDnsCache.clear();
+}
+
+function isFakeDnsAddress(address) {
+  return /^198\.(18|19)\.\d+\.\d+$/.test(String(address));
+}
+
+async function resolvePublicDns(hostname) {
+  const saved = publicDnsCache.get(hostname);
+  if (saved && saved.expires > Date.now()) return saved.address;
+  const url = new URL('https://cloudflare-dns.com/dns-query');
+  url.searchParams.set('name', hostname);
+  url.searchParams.set('type', 'A');
+  const response = await requestOnce(url, '1.1.1.1', 65536, false, { accept: 'application/dns-json' });
+  if (response.statusCode !== 200) throw new Error('公网 DNS 查询失败');
+  let data;
+  try { data = JSON.parse(response.body); } catch { throw new Error('公网 DNS 响应无效'); }
+  const question = data.Question?.[0];
+  if (data.Status !== 0 || String(question?.name || '').replace(/\.$/, '').toLowerCase() !== hostname) throw new Error('公网 DNS 未返回匹配结果');
+  const rows = (data.Answer || []).filter(row => row.type === 1 || row.type === 28);
+  if (!rows.length || rows.some(row => isPrivateIp(row.data))) throw new Error('公网 DNS 未返回安全公网地址');
+  const address = rows[0].data;
+  if (publicDnsCache.size >= 256) publicDnsCache.delete(publicDnsCache.keys().next().value);
+  const ttl = Math.max(1, Math.min(120, ...rows.map(row => Number(row.TTL) || 1)));
+  publicDnsCache.set(hostname, { address, expires: Date.now() + ttl * 1000 });
+  return address;
+}
 
 function withTimeout(promise, ms, label) {
   let timer;
@@ -126,6 +161,9 @@ export async function resolveSafeHost(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
+  if (allowFakeDnsFallback && addresses.every(({ address }) => isFakeDnsAddress(address))) {
+    return resolvePublicDns(h);
+  }
   for (const { address } of addresses) {
     if (isPrivateIp(address)) {
       throw new Error('域名解析到内网/本机地址，已阻止');
@@ -156,7 +194,7 @@ function validateLimit(value, name) {
 
 // 使用已校验的 IP 发起请求，保留原始 Host/SNI，禁止重新解析 DNS。
 // 总时限包含 TCP/TLS、响应头和响应体；仅 socket idle timeout 无法阻止慢速滴流。
-function requestOnce(url, ip, limit, binary = false) {
+function requestOnce(url, ip, limit, binary = false, headers = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let req;
@@ -187,6 +225,7 @@ function requestOnce(url, ip, limit, binary = false) {
           'user-agent': 'Mozilla/5.0',
           accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'accept-language': 'zh-CN,zh;q=0.9',
+          ...headers,
         },
         servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
         rejectUnauthorized: url.protocol === 'https:',
@@ -224,7 +263,9 @@ function requestOnce(url, ip, limit, binary = false) {
           if (!binary) { appendText(decoder.write(chunk)); return; }
           size += chunk.length;
           if (size > limit) {
-            finish(new Error(`图片超过大小限制（${limit} 字节）`));
+            const error = new Error(`图片超过大小限制（${limit} 字节）`);
+            error.code = 'FETCH_BODY_TOO_LARGE';
+            finish(error);
             res.destroy();
             return;
           }
@@ -287,13 +328,67 @@ export function looksLikeImageBuffer(buf) {
   return false;
 }
 
+/** TTS 音频下载：沿用 DNS 固定与内网防护，每一跳都由调用方限制来源域名。 */
+export async function safeFetchAudioBuffer(urlString, maxBytes, allowUrl) {
+  validateLimit(maxBytes, 'maxBytes');
+  if (typeof allowUrl !== 'function') throw new Error('音频下载必须指定来源校验');
+  let next = urlString;
+  for (let i = 0; i <= 3; i++) {
+    if (!allowUrl(next)) throw new Error('音频来源不允许');
+    const { url, ip } = await validateFetchUrl(next);
+    const result = await requestOnce(url, ip, maxBytes, true);
+    if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
+      if (!result.redirect) throw new Error('音频重定向缺少地址');
+      next = new URL(result.redirect, url).toString();
+      continue;
+    }
+    if (result.statusCode < 200 || result.statusCode >= 300) throw new Error('音频下载失败');
+    return { buffer: result.buffer };
+  }
+  throw new Error('音频重定向次数过多');
+}
+
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
 export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let { url, ip } = await validateFetchUrl(urlString);
+  let resized = false;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, ip, maxBytes, true);
+    // Public Sina image CDN expects ordinary browser hotlink headers. Derive
+    // them from an exact known CDN hostname; never forward caller headers or
+    // carry a referrer to an unrelated redirect destination.
+    // 新浪 CDN 只认带 Referer 的 https 请求；模型常给出 http:// 的图链，
+    // 这类链接拿不到防盗链头会全部 403。先原地升级为 https 再判断。
+    if (!url.port && url.protocol === 'http:' && /^(?:wx|ww)[1-4]\.sinaimg\.cn$/.test(url.hostname)) {
+      const upgraded = new URL(url.toString().replace(/^http:/, 'https:'));
+      ({ url, ip } = await validateFetchUrl(upgraded.toString()));
+    }
+    const sina = url.protocol === 'https:' && !url.port && /^(?:wx|ww)[1-4]\.sinaimg\.cn$/.test(url.hostname);
+    let headers = sina ? {
+      referer: 'https://weibo.com/',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    } : {};
+    if (url.protocol === 'https:' && !url.port && /(?:^|\.)hdslb\.com$/.test(url.hostname)) {
+      headers = { referer: 'https://www.bilibili.com/',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' };
+    }
+    // Cloudflare 在 donmai.us 上拦浏览器 UA（Mozilla/5.0 直接 403），
+    // 只放行 curl/qqbot 这类非浏览器 UA。
+    if (url.protocol === 'https:' && /(?:^|\.)donmai\.us$/.test(url.hostname)) {
+      headers = { 'user-agent': 'qqbot-image/1.0' };
+    }
+    let result;
+    try { result = await requestOnce(url, ip, maxBytes, true, headers); }
+    catch (error) {
+      // Use the CDN's public resized variant once, retaining the same image ID
+      // and the existing byte/pixel restrictions. No change for other sites.
+      if (!resized && sina && error.code === 'FETCH_BODY_TOO_LARGE' && /^\/large\/[a-zA-Z0-9]+\.(?:jpe?g|png|webp)$/i.test(url.pathname) && !url.search) {
+        const smaller = new URL(url); smaller.pathname = smaller.pathname.replace(/^\/large\//, '/mw2000/');
+        ({ url, ip } = await validateFetchUrl(smaller.toString())); resized = true; continue;
+      }
+      throw error;
+    }
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();

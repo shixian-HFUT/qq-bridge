@@ -1,11 +1,13 @@
 // Only the model-facing view is compacted. Stored messages and console/API data
 // retain the original fields for display, media retrieval and troubleshooting.
+import { maskModelText, safeModelDisplayName } from './model-safety.js';
+
 const DEFAULT_FALSE_FIELDS = new Set([
   'quoteTargetIsSelf', 'isOwner', 'isSelf', 'hasMedia', 'hasForward'
 ]);
 const OPTIONAL_FIELDS = new Set([
   'seq', 'messageId', 'sender', 'userId', 'text', 'plain', 'tail', 'kind',
-  'ownerLabel', 'media', 'forwardIds', 'nestedForwardIds'
+  'ownerLabel', 'media', 'forwardIds', 'nestedForwardIds', 'voiceRequestMessageId'
 ]);
 
 function isRecord(value) {
@@ -16,6 +18,30 @@ function isRecord(value) {
 
 function isEmpty(value) {
   return value == null || value === '' || (Array.isArray(value) && value.length === 0);
+}
+
+function uidFrom(record) {
+  return record?.userId ?? record?.user_id ?? record?.uid ?? null;
+}
+
+function sanitizeModelIdentity(record) {
+  if (!isRecord(record)) return record;
+  // Older stored bot replies incorrectly carried the owner's marker. Correct
+  // their model-facing identity without rewriting local conversation records.
+  if (record.isSelf === true) {
+    record.isOwner = false;
+    delete record.ownerLabel;
+  }
+  if (typeof record.sender === 'string') {
+    record.sender = safeModelDisplayName(record.sender, uidFrom(record));
+  }
+  if (typeof record.nickname === 'string') {
+    record.nickname = safeModelDisplayName(record.nickname, record.user_id ?? record.userId ?? record.uid);
+  }
+  if (typeof record.card === 'string') {
+    record.card = safeModelDisplayName(record.card, record.user_id ?? record.userId ?? record.uid);
+  }
+  return record;
 }
 
 function compactMedia(media, canResolveByMessage) {
@@ -51,6 +77,10 @@ export function compactModelMessage(message) {
     if (seenText.has(result[key])) delete result[key];
     else seenText.add(result[key]);
   }
+  sanitizeModelIdentity(result);
+  for (const [key, value] of Object.entries(result)) {
+    result[key] = compactModelData(value, key);
+  }
   for (const key of OPTIONAL_FIELDS) {
     if (isEmpty(result[key])) delete result[key];
   }
@@ -64,15 +94,24 @@ export function compactModelMessage(message) {
   return result;
 }
 
-export function compactModelData(data) {
-  if (Array.isArray(data)) return data.map(compactModelData);
-  if (!isRecord(data)) return data;
-  return Object.fromEntries(Object.entries(data).map(([key, value]) => [
-    key,
-    (key === 'messages' || key === 'newMessages') && Array.isArray(value)
-      ? value.map(compactModelMessage)
-      : compactModelData(value)
-  ]));
+export function compactModelData(data, parentKey = '') {
+  if (Array.isArray(data)) {
+    return data.map((item) => (
+      parentKey === 'messages' || parentKey === 'newMessages'
+        ? compactModelMessage(item)
+        : compactModelData(item, parentKey)
+    ));
+  }
+  if (!isRecord(data)) return typeof data === 'string' ? maskModelText(data) : data;
+  const result = sanitizeModelIdentity({ ...data });
+  for (const [key, value] of Object.entries(result)) {
+    if ((key === 'messages' || key === 'newMessages') && Array.isArray(value)) {
+      result[key] = value.map(compactModelMessage);
+    } else {
+      result[key] = compactModelData(value, key);
+    }
+  }
+  return result;
 }
 
 export function serializeModelData(data) {

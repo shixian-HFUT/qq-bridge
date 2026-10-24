@@ -46,7 +46,7 @@ const DEFAULT_RULES = {
   // 路径/整行匹配到这些就跳过（脱敏模板、示例、测试夹具、已声明含占位符的文档）。
   // 注意：这是**误报白名单**，不是"这些文件不用检查"——加入前先确认里面确实只有占位数据。
   allowPaths: [
-    'scripts/privacy-', 'config.example.json', 'package-lock.json', 'runtime/pi/package-lock.json', 'src/sensitive.js',
+    'scripts/privacy-', 'config.example.json', 'package-lock.json', 'src/sensitive.js',
     // 测试夹具/回归脚本：里面是刻意构造的假 ID 与假凭据
     'scripts/test-', 'scripts/console-ui-', 'scripts/fixtures/', 'scripts/audit-bridge-harness.mjs',
     'scripts/check-onebot-status.mjs', 'scripts/send-test-group.mjs', 'scripts/send-voice.mjs',
@@ -63,6 +63,12 @@ const DEFAULT_RULES = {
     //    今后新增的真实泄漏不会被扫出来。要收紧，正确做法是给扫描器加
     //    「文件 + 规则名」粒度（或让凭据规则只认高熵字面量），而不是继续往这里加文件。
     'docs/guides/PRIVACY.md', 'src/bridge.js', 'src/dsh-client.js',
+    // ── 以下两项同理（2026-10-05 补）：它们记录本机补丁备份的**文件名**，其中的 ISO 时间戳
+    //    （例 `bridge.js.before-t19-snapshot-low-2026-10-04T13-49-20-694Z`）会被「疑似令牌/密钥
+    //    （高熵串）」规则命中。此前只写在本地 privacy-rules.json 的 allowPaths 里，所以**全新克隆**
+    //    跑 npm run privacy-scan 是红的（exit=1）—— 对一个开箱即用的仓库不可接受。
+    //    代价同上：这两份文档今后不再被逐行扫描。
+    'docs/guides/LOCAL_PATCHES.md', 'docs/guides/SHARED_MEMORY_REPLAY.md',
   ],
 };
 
@@ -219,7 +225,7 @@ for (const rel of files) {
   // ② 内容级：一个文件里同一规则最多报 3 处（带行号），方便直接定位；不要把整文件刷屏。
   for (const rule of rules.deny) {
     let re;
-    try { re = new RegExp(rule.pattern, rule.flags ?? 'g'); }
+    try { re = new RegExp(rule.pattern, [...new Set((rule.flags || '') + 'g')].join('')); }
     catch (error) { console.error(`[privacy-scan] 规则「${rule.name}」正则非法：${error.message}`); continue; }
     re.lastIndex = 0;
     let m;
@@ -234,6 +240,9 @@ for (const rel of files) {
       const value = m[0];
       if (m.index === re.lastIndex) re.lastIndex += 1; // 空匹配保护
       if (isNoise(value, rule)) continue;
+      const lineText = text.slice(text.lastIndexOf('\n', m.index) + 1, text.indexOf('\n', m.index) < 0 ? text.length : text.indexOf('\n', m.index));
+      if (rule.requireNonHex && /^\s*"integrity"\s*:\s*"sha(?:256|384|512)-/.test(lineText)) continue;
+      if (rule.name.startsWith('疑似凭据赋值') && /[:=]\s*(?:process\.env\.|this\.)/.test(value)) continue;
       hits += 1;
       const line = text.slice(0, m.index).split('\n').length;
       findings.push({ kind: 'content', rule: rule.name, file: normalized, line, masked: mask(value) });
@@ -255,6 +264,7 @@ for (const rel of files) {
  * 真凭据是**混合大小写 + 数字**的高熵串，因此下面要求"同时含小写与大写与数字"。
  */
 function isNoise(value, rule) {
+  if (!rule.requireNonHex) return rule.name.startsWith('QQ 号') && ['123456789', '987654321', '2147483647', '4294967295'].includes(value);
   if (rule.requireNonHex && /^[0-9a-f]+$/i.test(value)) return true;
   if (/^[A-Z0-9_]+$/.test(value)) return true;                       // 环境变量名/常量
   if (/^[a-z0-9._-]+$/.test(value)) return true;                     // 文件名/包名/路径片段

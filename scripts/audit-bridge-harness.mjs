@@ -18,12 +18,18 @@ import * as sticker from '../src/sticker-lib.js';
 import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
-import * as roleCard from '../src/role-card.js';
+import { isVoiceRequest, VoiceRequestStore, runVoiceAction } from '../src/voice-request.js';
+import * as voiceCadence from '../src/voice-cadence.js';
+import { loadTtsConfig, validateSpeech } from '../src/aliyun-tts.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import { inFlightTurnEvents } from '../src/in-flight-turns.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
+import * as roleCard from '../src/role-card.js';
+import { MemoryStore, LONG_MEMORY_KINDS } from '../src/memory-store.js';
+import { ImageOutbox } from '../src/image-outbox.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-export async function bridgeHarness({ config = {}, savedState, globals = {} } = {}) {
+export async function bridgeHarness({ config = {}, savedState, savedSocialState, globals = {} } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-'));
   fs.mkdirSync(path.join(temp, 'src'));
   fs.mkdirSync(path.join(temp, 'state'));
@@ -33,6 +39,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     consoleToken: 'fixture-console-token', slang: { enabled: false }, ...config,
   }));
   if (savedState) fs.writeFileSync(path.join(temp, 'state/sessions.json'), JSON.stringify(savedState));
+  if (savedSocialState) fs.writeFileSync(path.join(temp, 'state/social-v2.json'), JSON.stringify(savedSocialState));
   const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], http: [] };
   // 语音发送在桥接里是**直接 fetch 网关**（与文本/表情共用 sendChain，但要自己带 record 段），
   // 所以这里给 VM 注入一个记录型 fetch：既不让测试真的发 QQ 消息，又能断言发出的段内容。
@@ -104,10 +111,11 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   source = source.slice(0, source.indexOf("process.on('SIGINT'"));
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
-    ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
+    rebuildInFlightCollector, collectors, ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
-    getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
+    getSocialV2State, ensureWakeableV2, appendSocialV2Message, recordSentMessagesV2, longMemory, memoryContextV3,
     evaluateWakeTriggerV2, scheduleReplyCheckV2,
+    pumpMux, pendingWakeKeys, wakeConfigMissCount,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
@@ -132,9 +140,13 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
-    discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
-    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
+    discoverDshLaunchToken: () => '', unwrap, createTurnCollector, inFlightTurnEvents,
+    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ImageOutbox,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...roleCard,
+    MemoryStore, LONG_MEMORY_KINDS,
+    LocalImages: class {}, // no local generation process in HTTP/flow fixtures
+    isVoiceRequest, VoiceRequestStore, runVoiceAction, loadTtsConfig, validateSpeech, ...voiceCadence,
+    synthesizeLocal: async () => { throw new Error('local TTS disabled in fixture'); },
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),
@@ -157,9 +169,13 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     cleanupTemp: () => {},
     ...globals,
   });
-  // Execute the pure model view in the bridge realm. Its plain-object checks
-  // should see the same prototypes as real bridge messages, just as in Node.
-  const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8').replace(/^export /gm, '');
+  // Execute the pure model safety/view helpers in the bridge realm. Their plain-object
+  // checks should see the same prototypes as real bridge messages, just as in Node.
+  const modelSafetySource = fs.readFileSync(path.join(root, 'src/model-safety.js'), 'utf8').replace(/^export /gm, '');
+  vm.runInContext(`Object.assign(globalThis, (() => { ${modelSafetySource}\nreturn { containsUnsafeModelText, maskModelText, safeModelDisplayName }; })());`, context);
+  const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8')
+    .replace(/^import[^\n]*;\n/gm, '')
+    .replace(/^export /gm, '');
   vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData }; })());`, context);
   vm.runInContext(source + '\nglobalThis.auditReady = main();', context);
   const bridge = await context.auditReady;
@@ -167,6 +183,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
     for (const timer of timers) clearTimeout(timer);
+    bridge.longMemory?.close();
     fs.rmSync(temp, { recursive: true, force: true });
   } };
 }

@@ -195,7 +195,10 @@ test('守卫导出的名单与本测试的清单一致（防两份名单各自�
   }
 });
 
-test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错假名静默失效）', async () => {
+test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错假名静默失效）', async t => {
+  if (process.env.QQ_BRIDGE_TEST_LIVE === '0' && !process.env.DSH_TOOL_PACKAGES) {
+    t.skip('离线套件不读取宿主 DSH 安装；单独运行并设置 DSH_TOOL_PACKAGES 验证所用版本'); return;
+  }
   // 为什么必须测：`tools.restrict()` 对未知名字会**抛错**，而守卫逐个 try/catch
   // 只打日志 ⇒ 拼错的名字 = **静默 no-op**。这正是本名单初版的真实缺陷：
   // pwsh_persistent / bash_persistent / cordis / goal_write / goal_read 五个假名

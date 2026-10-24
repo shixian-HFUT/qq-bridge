@@ -1,5 +1,7 @@
 {
-  "runtime": { "backend": "dsh" },
+  "runtime": {
+    "backend": "dsh"
+  },
   "dsh": {
     "baseUrl": "http://127.0.0.1:3080",
     "provider": "deepseek-official",
@@ -141,7 +143,11 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendVoice": false,
+      "sendImage": true,
+      "searchImages": true,
+      "speak": false,
+      "generateImage": false
     },
     "wake": {
       "defaultMode": "diving",
@@ -250,6 +256,31 @@
       "wakeMessageLimit": 12,
       "wakeRecentLimit": 4,
       "wakeMaxChars": 6000
+    },
+    "memory": {
+      "longTerm": {
+        "enabled": true,
+        "learning": {
+          "dailyRequests": 2
+        }
+      }
+    },
+    "sharedMemory": {
+      "enabled": false,
+      "keys": [],
+      "migrate": false
     }
+  },
+  "imageGeneration": {
+    "enabled": false,
+    "server": "http://127.0.0.1:8188",
+    "outputDir": "",
+    "templateFile": ""
+  },
+  "imageSearch": {
+    "nsfwInPrivate": false
+  },
+  "webSearch": {
+    "provider": "bing"
   }
 }

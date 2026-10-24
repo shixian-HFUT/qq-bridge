@@ -2044,6 +2044,7 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="slangSubmit"> <span><b>qq_slang_submit</b><span class="meta">AI 提交陌生词/黑话给管理员筛选</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="listStickers"> <span><b>qq_list_stickers</b><span class="meta">查看/搜索 QQ 收藏表情（含备注和本地笔记）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getStickerImage"> <span><b>qq_get_sticker_image</b><span class="meta">看图理解没有备注的收藏表情</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendImage"> <span><b>qq_send_image</b><span class="meta">发送网上图片或转发当前会话图片</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendSticker"> <span><b>qq_send_sticker</b><span class="meta">发送收藏表情（一条消息只能一张，不能带文字）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="collectSticker"> <span><b>qq_collect_sticker</b><span class="meta">AI 偶尔收藏别人发的表情并写简短备注</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getSelfImage"> <span><b>qq_get_self_image</b><span class="meta">查看自己的默认 Q 版形象图片</span></span></label>
@@ -2245,6 +2246,16 @@ button:active:not(:disabled) {
         <span class="meta" id="v2MemoryMsg"></span>
       </div>
       <div id="v2MemoryOutput" class="tool-log-table">（空）</div>
+
+      </div></details>
+<details class="settings-group" id="v2SnapPanel"><summary>记忆快照（列表 / 立即存档 / 回滚）</summary><div class="settings-content">
+      <div class="row">
+        <button id="v2SnapRefresh" class="small">加载快照列表</button>
+        <button id="v2SnapCreate" class="small">立即存档</button>
+        <span class="meta" id="v2SnapMsg"></span>
+      </div>
+      <div class="meta" style="margin-top:6px">快照存放在 <code>state/memory-snapshots/</code>，由桥接自动按天生成。「立即存档」会立刻补一份（当天已有 daily 快照时另存为独立文件，不覆盖 daily）。「回滚」会用选中的快照覆盖跨会话共享记忆与该快照里出现过的会话记忆；<b>回滚前会先自动存一份 pre-rollback 快照，可用于撤销</b>；「你想说但还没说的」不受影响。</div>
+      <div id="v2SnapList" class="tool-log-table"><div class="meta" style="padding:8px">快照列表：展开本面板时自动加载。</div></div>
 
       </div></details>
 <details class="settings-group"><summary>唤醒状态（AI 当前设置的下一次唤醒条件/倒计时）</summary><div class="settings-content">
@@ -2631,6 +2642,8 @@ async function api(path, method, body, _retried = 0) {
   const headers = body ? {'content-type':'application/json'} : {};
   const token = localStorage.getItem('consoleToken');
   if (token) headers['x-console-token'] = token;
+  // 管理端正向标记（t7-R4）：桥接只认这个头才给 owner 权限（清全局共享桶、跨来源改删等）。
+  headers['x-console-admin'] = '1';
   const res = await fetch(path, { method: method || 'GET', headers, body: body ? JSON.stringify(body) : undefined });
   if (res.status === 401) {
     if (_retried >= 2) {
@@ -3534,6 +3547,63 @@ document.getElementById('v2ToolLogOutput').addEventListener('click', (ev) => {
   }
 });
 
+function renderLongMemory(data) {
+  if (!data?.ok) return '<div class="meta">长期记忆尚未加载或服务未更新</div>';
+  const labels = { userFact: '人物档案', event: '共同经历', lesson: '交流经验' };
+  const usage = data.stats?.learning || {};
+  let html = '<div class="memory-section"><b>长期记忆与自主学习</b> '
+    + '<button class="small" data-v3-action="add">新增</button> <button class="small" data-v3-action="backup">备份</button>'
+    + `<div class="meta">今日额外学习请求 ${Number(usage.requests) || 0} 次；输入预算占用 ${Number(usage.input) || 0}，输出 ${Number(usage.output) || 0}。自动记忆 ${Number(data.preview?.chars) || 0} 字符。旧资料标为待核实。</div>`;
+  for (const row of data.entries || []) {
+    html += `<div style="margin:6px 0">${esc(labels[row.kind] || row.kind)} ${esc(row.subject || '')}：${esc(row.content)} `
+      + `<span class="meta">${row.status === 'candidate' ? '待核实' : '有效'} · ${esc(row.origin || '')}</span> `
+      + `<button class="small" data-v3-action="edit" data-id="${esc(row.id)}" data-revision="${row.revision}" data-content="${esc(row.content)}">${row.status === 'candidate' ? '核实并编辑' : '编辑'}</button> `
+      + `<button class="small" data-v3-action="remove" data-id="${esc(row.id)}" data-revision="${row.revision}">忘记</button></div>`;
+  }
+  html += '<div style="margin-top:8px"><input id="v3HistoryQuery" placeholder="搜索当前会话历史" style="max-width:240px"> '
+    + '<button class="small" data-v3-action="history">搜索历史</button><div id="v3HistoryOutput" class="meta"></div></div></div>';
+  return html;
+}
+async function handleLongMemoryButton(btn) {
+  const key = document.getElementById('v2MemoryKey').value.trim();
+  const action = btn.dataset.v3Action;
+  const msg = document.getElementById('v2MemoryMsg');
+  try {
+    if (action === 'history') {
+      const q = document.getElementById('v3HistoryQuery').value.trim();
+      if (!q) return;
+      const r = await api('/api/socialV2/memory-history?key=' + encodeURIComponent(key) + '&q=' + encodeURIComponent(q));
+      document.getElementById('v3HistoryOutput').innerHTML = r.ok
+        ? (r.messages || []).map(m => `<div style="margin:6px 0">${esc(new Date(m.at).toLocaleString())} · ${m.isSelf ? '机器人' : esc(m.uid || '未知')}：${esc(m.text)}${m.truncated ? '（摘录）' : ''}</div>`).join('') || '没有找到已归档记录'
+        : esc(r.error || '查询失败');
+      return;
+    }
+    let body = { key };
+    if (action === 'backup') body.backup = true;
+    else if (action === 'add') {
+      const label = prompt('记忆类型：人物 / 事件 / 经验', '人物');
+      if (label === null) return;
+      const kind = { 人物: 'userFact', 事件: 'event', 经验: 'lesson' }[label.trim()];
+      if (!kind) throw Error('请选择人物、事件或经验');
+      const subject = kind === 'userFact' ? prompt('人物 QQ 号：', key.startsWith('private:') ? key.split(':')[1] : '') : '';
+      if (subject === null) return;
+      const content = prompt('记忆内容（最多240字）：');
+      if (!content?.trim()) return;
+      body.operations = [{ kind, subject, content }];
+    } else {
+      const op = { action: action === 'remove' ? 'remove' : 'patch', id: btn.dataset.id, revision: Number(btn.dataset.revision) };
+      if (op.action === 'patch') {
+        op.content = prompt('核实并编辑记忆（最多240字）：', btn.dataset.content || '');
+        if (!op.content?.trim()) return;
+      }
+      body.operations = [op];
+    }
+    const r = await api('/api/socialV2/long-memory', 'POST', body);
+    if (!r.ok) throw Error(r.error || '记忆操作失败');
+    msg.textContent = action === 'backup' ? '已备份：' + r.file : '长期记忆已更新';
+    await loadV2Memory();
+  } catch (error) { msg.textContent = error.message; msg.className = 'meta err'; }
+}
 function renderV2Memory(data) {
   const box = document.getElementById('v2MemoryOutput');
   if (!data || !data.ok) {
@@ -3544,28 +3614,33 @@ function renderV2Memory(data) {
   const topics = Array.isArray(raw.activeTopics) ? raw.activeTopics : [];
   const thoughts = Array.isArray(raw.pendingThoughts) ? raw.pendingThoughts : [];
   const impressions = raw.memberImpressions && typeof raw.memberImpressions === 'object' ? raw.memberImpressions : {};
-  let html = '<div style="padding:8px">';
-  html += '<div class="memory-section"><b>进行中的话题</b> <button class="small" data-action="clear" data-cat="activeTopic">清空</button>';
+  let html = '<div style="padding:8px">' + renderLongMemory(data.longTerm);
+  html += '<div class="meta" style="margin-bottom:6px">⚠️「进行中的话题」「对群友的印象」来自<b>跨会话共享桶</b>（群与所有私聊共用，所有会话都能看到；非本会话写入的条目会标注来源）；「你想说但还没说的」只属于该会话。</div>';
+  html += '<div class="memory-section"><b>进行中的话题</b> <span class="meta">（共享）</span> <button class="small" data-action="clear" data-cat="activeTopic">清空</button>';
   if (!topics.length) html += '<div class="meta">（空）</div>';
   for (const t of topics) {
     const text = esc(String(t?.text || ''));
     const extra = t?.pendingQuestion ? `；待追问：${esc(String(t.pendingQuestion))}` : '';
-    html += `<div style="margin:4px 0">📌 ${text}${extra} <button class="small" data-action="edit" data-cat="activeTopic" data-content="${esc(String(t?.text || ''))}">编辑</button> <button class="small" data-action="remove" data-cat="activeTopic" data-content="${esc(String(t?.text || ''))}">删除</button></div>`;
+    const src = t?.lastSourceKey ? ` <span class="meta">来自 ${esc(String(t.lastSourceKey))}</span>` : '';
+    html += `<div style="margin:4px 0">📌 ${text}${extra}${src} <button class="small" data-action="edit" data-cat="activeTopic" data-content="${esc(String(t?.text || ''))}">编辑</button> <button class="small" data-action="remove" data-cat="activeTopic" data-content="${esc(String(t?.text || ''))}">删除</button></div>`;
   }
   html += '</div>';
-  html += '<div class="memory-section"><b>你想说但还没说的</b> <button class="small" data-action="clear" data-cat="pendingThought">清空</button>';
+  html += '<div class="memory-section"><b>你想说但还没说的</b> <span class="meta">（仅本会话）</span> <button class="small" data-action="clear" data-cat="pendingThought">清空</button>';
   if (!thoughts.length) html += '<div class="meta">（空）</div>';
   for (const t of thoughts) {
     html += `<div style="margin:4px 0">💭 ${esc(String(t?.text || ''))}${t?.motivation ? `（${esc(String(t.motivation))}）` : ''} <button class="small" data-action="edit" data-cat="pendingThought" data-content="${esc(String(t?.text || ''))}">编辑</button> <button class="small" data-action="remove" data-cat="pendingThought" data-content="${esc(String(t?.text || ''))}">删除</button></div>`;
   }
   html += '</div>';
-  html += '<div class="memory-section"><b>对群友的印象</b> <button class="small" data-action="clear" data-cat="memberImpression">清空</button>';
+  html += '<div class="memory-section"><b>对群友的印象</b> <span class="meta">（共享）</span> <button class="small" data-action="clear" data-cat="memberImpression">清空</button>';
   const names = Object.keys(impressions);
   if (!names.length) html += '<div class="meta">（空）</div>';
   for (const name of names) {
     const im = impressions[name] || {};
+    // 印象主键现在是 QQ 号（t7-R1），昵称只做显示：「昵称（uid）」。
+    const display = im.name ? (im.uid || name !== im.name ? `${im.name}（${im.uid || name}）` : im.name) : name;
     const traits = Array.isArray(im.traits) ? im.traits : [];
-    html += `<div style="margin:4px 0">👤 ${esc(name)}：${traits.length ? esc(traits.join('、')) : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次） <button class="small" data-action="edit" data-cat="memberImpression" data-target="${esc(name)}" data-traits="${esc(traits.join(', '))}">编辑</button> <button class="small" data-action="remove" data-cat="memberImpression" data-target="${esc(name)}">删除</button></div>`;
+    const src = im?.lastSourceKey ? ` <span class="meta">来自 ${esc(String(im.lastSourceKey))}</span>` : '';
+    html += `<div style="margin:4px 0">👤 ${esc(display)}：${traits.length ? esc(traits.join('、')) : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次）${src} <button class="small" data-action="edit" data-cat="memberImpression" data-target="${esc(name)}" data-traits="${esc(traits.join(', '))}">编辑</button> <button class="small" data-action="remove" data-cat="memberImpression" data-target="${esc(name)}">删除</button></div>`;
   }
   html += '</div></div>';
   box.innerHTML = html;
@@ -3577,7 +3652,8 @@ function loadV2Memory() {
   msg.textContent = '加载中…';
   msg.className = 'meta';
   return api('/api/socialV2/memory?key=' + encodeURIComponent(key))
-    .then(r => {
+    .then(async r => {
+      try { r.longTerm = await api('/api/socialV2/long-memory?key=' + encodeURIComponent(key)); } catch {}
       renderV2Memory(r);
       msg.textContent = r.ok ? '✅ 已加载' : ('❌ ' + (r.error || '失败'));
       msg.className = r.ok ? 'meta ok' : 'meta err';
@@ -3592,13 +3668,16 @@ document.getElementById('v2MemoryClearAll').addEventListener('click', async () =
   const key = document.getElementById('v2MemoryKey').value.trim();
   const msg = document.getElementById('v2MemoryMsg');
   if (!key) { msg.textContent = '请输入会话 key'; msg.className = 'meta err'; return; }
-  if (!confirm('确定清空该会话全部轻量记忆？')) return;
-  const r = await api('/api/socialV2/memory-clear', 'POST', { key, category: '' });
-  msg.textContent = r.ok ? '✅ 已清空全部记忆' : ('❌ ' + (r.error || '失败'));
+  if (!confirm('确定清空该会话的全部轻量记忆？\n\n注意：「进行中的话题」「对群友的印象」是跨会话共享的，管理端清空会连同共享桶一起清掉，所有会话都会受影响；「你想说但还没说的」只清本会话。')) return;
+  const r = await api('/api/socialV2/memory-clear', 'POST', { key, category: '', allSessions: true });
+  const scopeInfo = (r && r.shared) ? `（共享桶清除 话题 ${r.shared.topicsRemoved} / 印象 ${r.shared.impressionsRemoved}，范围 ${r.shared.scope === 'all' ? '全部会话' : '仅本会话写入'}）` : '';
+  msg.textContent = r.ok ? `✅ 已清空全部记忆${scopeInfo}` : ('❌ ' + (r.error || '失败'));
   msg.className = r.ok ? 'meta ok' : 'meta err';
   if (r.ok) loadV2Memory();
 });
 document.getElementById('v2MemoryOutput').addEventListener('click', async (ev) => {
+  const longButton = ev.target.closest('button[data-v3-action]');
+  if (longButton) { await handleLongMemoryButton(longButton); return; }
   const btn = ev.target.closest('button[data-action]');
   if (!btn) return;
   const key = document.getElementById('v2MemoryKey').value.trim();
@@ -3608,7 +3687,13 @@ document.getElementById('v2MemoryOutput').addEventListener('click', async (ev) =
   const action = btn.dataset.action;
   let r;
   if (action === 'clear') {
-    r = await api('/api/socialV2/memory-clear', 'POST', { key, category: cat });
+    if (cat === 'activeTopic' || cat === 'memberImpression') {
+      const label = cat === 'activeTopic' ? '进行中的话题' : '对群友的印象';
+      if (!confirm(`确定清空「${label}」？这是跨会话共享的内容，清空会影响所有会话。`)) return;
+      r = await api('/api/socialV2/memory-clear', 'POST', { key, category: cat, allSessions: true });
+    } else {
+      r = await api('/api/socialV2/memory-clear', 'POST', { key, category: cat });
+    }
   } else if (action === 'edit') {
     let newContent;
     let newExtra = {};
@@ -3628,6 +3713,113 @@ document.getElementById('v2MemoryOutput').addEventListener('click', async (ev) =
   msg.textContent = r.ok ? '✅ 已更新' : ('❌ ' + (r.error || '失败'));
   msg.className = r.ok ? 'meta ok' : 'meta err';
   if (r.ok) loadV2Memory();
+});
+
+// ── 记忆快照面板（N6）：列表 / 立即存档 / 回滚（二次确认）──────────────────
+// 桥接的 3 个快照接口只对控制台开放（带 x-agent-call / x-agent-token 的请求一律 403），
+// 这里统一走页面既有的 api()（自动带 x-console-admin，鉴权开启时还会带 token），不另造 fetch。
+function snapshotSizeText(size) {
+  const n = Number(size);
+  if (!Number.isFinite(n) || n < 0) return '未知';
+  return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB（${n} B）`;
+}
+function renderV2Snapshots(r) {
+  const box = document.getElementById('v2SnapList');
+  if (!box) return;
+  if (!r || !r.ok) {
+    box.innerHTML = `<div class="meta err" style="padding:8px">加载失败：${esc((r && r.error) || '未知错误')}</div>`;
+    return;
+  }
+  const list = Array.isArray(r.snapshots) ? r.snapshots : [];
+  let html = `<div class="meta" style="padding:6px 8px">目录 ${esc(r.dir || 'state/memory-snapshots')} · 保留 ${Number(r.keepDays) || 0} 天 · 快照功能${r.enabled ? '已启用' : '已关闭（socialV2.memory.snapshotEnabled=false）'} · 共 ${list.length} 份</div>`;
+  if (!list.length) {
+    html += '<div class="meta" style="padding:8px">尚无记忆快照：state/memory-snapshots 里没有可回滚的文件。点「立即存档」即可生成一份（当天已有 daily 快照时会另存为独立文件，不覆盖 daily）。</div>';
+    box.innerHTML = html;
+    return;
+  }
+  for (const s of list) {
+    html += '<div style="padding:6px 8px;border-top:1px solid var(--card-border)">'
+      + `<div>🗂 <b>${esc(String(s.file || ''))}</b> <span class="meta">${esc(String(s.date || ''))}</span></div>`
+      + `<div class="meta">原因 ${esc(String(s.reason || '未知'))} · 大小 ${esc(snapshotSizeText(s.size))} · 会话 ${Number(s.conversations) || 0} · 话题 ${Number(s.topics) || 0} · 印象 ${Number(s.impressions) || 0}`
+      + (s.createdAtIso ? ` · 生成于 ${esc(String(s.createdAtIso))}` : '')
+      + ` <button class="small danger" data-snap-rollback="${esc(String(s.file || ''))}">回滚</button></div>`
+      + '</div>';
+  }
+  box.innerHTML = html;
+}
+// 只刷新列表、不动 #v2SnapMsg：存档 / 回滚成功后的返回信息必须留在提示里。
+async function refreshV2Snapshots() {
+  const r = await api('/api/socialV2/memory-snapshots');
+  renderV2Snapshots(r);
+  return r;
+}
+async function loadV2Snapshots() {
+  const msg = document.getElementById('v2SnapMsg');
+  if (msg) { msg.textContent = '加载中…'; msg.className = 'meta'; }
+  try {
+    const r = await refreshV2Snapshots();
+    if (msg) {
+      msg.textContent = r.ok ? `✅ 已加载 ${Array.isArray(r.snapshots) ? r.snapshots.length : 0} 份快照` : `❌ ${r.error || '失败'}`;
+      msg.className = r.ok ? 'meta ok' : 'meta err';
+    }
+  } catch (e) {
+    renderV2Snapshots(null);
+    if (msg) { msg.textContent = `❌ ${e.message || e}`; msg.className = 'meta err'; }
+  }
+}
+async function createV2Snapshot() {
+  const msg = document.getElementById('v2SnapMsg');
+  if (msg) { msg.textContent = '存档中…'; msg.className = 'meta'; }
+  try {
+    const r = await api('/api/socialV2/memory-snapshot', 'POST', {});
+    if (msg) {
+      msg.textContent = r.ok
+        ? `✅ 已存档：${r.file}${r.keptDailySnapshot ? '（当天已有 daily 快照，这份另存为独立文件，daily 未被改动）' : ''}`
+        : `❌ ${r.error || '失败'}`;
+      msg.className = r.ok ? 'meta ok' : 'meta err';
+    }
+    if (r.ok) await refreshV2Snapshots();
+  } catch (e) {
+    if (msg) { msg.textContent = `❌ ${e.message || e}`; msg.className = 'meta err'; }
+  }
+}
+async function rollbackV2Snapshot(file) {
+  const msg = document.getElementById('v2SnapMsg');
+  const name = String(file || '').trim();
+  if (!name) return;
+  const confirmed = confirm(
+    `确定回滚到快照 ${name}？\n\n`
+    + '会用这份快照覆盖「跨会话共享记忆」以及该快照里出现过的会话记忆（「你想说但还没说的」不受影响）。\n'
+    + '回滚前会先自动存一份 pre-rollback 快照，可用于撤销。'
+  );
+  if (!confirmed) return;
+  if (msg) { msg.textContent = '回滚中…'; msg.className = 'meta'; }
+  try {
+    const r = await api('/api/socialV2/memory-rollback', 'POST', { file: name });
+    if (msg) {
+      msg.textContent = r.ok
+        ? `✅ 已回滚到 ${r.file}；preRollbackFile=${r.preRollbackFile || '（写入失败）'}；restoredConversations=${Number(r.restoredConversations) || 0} 个会话`
+        : `❌ ${r.error || '失败'}`;
+      msg.className = r.ok ? 'meta ok' : 'meta err';
+    }
+    if (r.ok) await refreshV2Snapshots();
+  } catch (e) {
+    if (msg) { msg.textContent = `❌ ${e.message || e}`; msg.className = 'meta err'; }
+  }
+}
+document.getElementById('v2SnapRefresh').addEventListener('click', () => loadV2Snapshots());
+document.getElementById('v2SnapCreate').addEventListener('click', createV2Snapshot);
+document.getElementById('v2SnapList').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-snap-rollback]');
+  if (!btn) return;
+  rollbackV2Snapshot(btn.dataset.snapRollback || '');
+});
+// 首次展开面板时才发请求：不在页面加载阶段请求（离线 fixture 预览没有这 3 个 mock）。
+let v2SnapLoadedOnce = false;
+document.getElementById('v2SnapPanel').addEventListener('toggle', (ev) => {
+  if (!ev.target.open || v2SnapLoadedOnce) return;
+  v2SnapLoadedOnce = true;
+  loadV2Snapshots();
 });
 
 function formatWakeStatus(r) {

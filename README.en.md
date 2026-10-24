@@ -1,5 +1,7 @@
 # QQ ↔ DeepSeek Harness Bridge (qq-bridge)
 
+> Fork v0.3.1 adds source-bound memory, image search and delivery deduplication, group identity and observation fixes, optional TTS, and Pi archive maintenance. DSH remains the default. See [update and configuration notes](docs/guides/FORK_UPDATE_2026_10.md) (Chinese), including memory sharing and optional external services.
+
 > This fork also offers an optional **Pi agent backend**. It can end a reply after the send tool confirms successful delivery and acknowledgement, avoiding a trailing model request. Background observation wakes the model on new messages instead of keeping an idle polling turn. DSH remains the default. See [configuration, limitations and offline reproduction](docs/guides/PI_BACKEND.md).
 
 > Connect QQ messages to DeepSeek Harness (DSH) agents: QQ friends/groups become DSH conversations, and agent replies (including questions and tool approvals) are sent back to QQ.

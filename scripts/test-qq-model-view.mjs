@@ -7,6 +7,7 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { compactModelMessage, compactModelData, serializeModelData } from '../src/qq-model-view.js';
+import { containsUnsafeModelText, maskModelText, safeModelDisplayName } from '../src/model-safety.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const shortMessage = {
@@ -15,6 +16,53 @@ const shortMessage = {
   quoteTargetIsSelf: false, isOwner: false, ownerLabel: '', isSelf: false,
   media: [], hasMedia: false, forwardIds: [], hasForward: false, time: 1789680000000
 };
+
+test('unsafe display names fall back to stable identity while ordinary names remain unchanged', () => {
+  assert.equal(safeModelDisplayName('半瘫少女在线足♀交吗', '2262232408'), '群友(2262232408)');
+  assert.equal(safeModelDisplayName('足 交', '42'), '群友(42)');
+  assert.equal(safeModelDisplayName('足交', ''), '群友');
+  assert.equal(safeModelDisplayName('小明', '10001'), '小明');
+  assert.equal(safeModelDisplayName('', '10001'), '群友(10001)');
+  assert.equal(containsUnsafeModelText('足♀交'), true);
+  assert.equal(maskModelText('他说足♀交'), '他说***');
+  assert.equal(maskModelText('这题真牛逼'), '这题真牛逼');
+});
+
+test('model messages mask unsafe sender and body without touching stored input', () => {
+  const stored = {
+    seq: 22, messageId: '-2027', sender: '半瘫少女在线足♀交吗', userId: '2262232408',
+    text: '他说足交', plain: '他说足交', tail: '他说足交',
+    quote: { sender: '牛至', text: '引用足交' },
+    quoteTargetIsSelf: false, isSelf: false, media: [], forwardIds: [], time: 1
+  };
+  const snapshot = structuredClone(stored);
+  const model = compactModelMessage(stored);
+  assert.deepEqual(stored, snapshot);
+  assert.equal(model.sender, '群友(2262232408)');
+  assert.equal(model.text, '他说***');
+  assert.equal('plain' in model, false);
+  assert.equal('tail' in model, false);
+  assert.equal(model.quote.sender, '群友');
+  assert.equal(model.quote.text, '引用***');
+});
+
+test('recursive model data sanitizes member identities and nested sender objects', () => {
+  const data = {
+    members: [{ sender: '足交', userId: '1', count: 2 }],
+    info: { sender: '牛至', userId: '2', text: '足交' },
+    groupMembers: [{ user_id: '3', nickname: '小明', card: '足♀交' }],
+    raw: { sender: { user_id: '4', card: '牛至', nickname: '普通' }, message: [{ data: { text: '足交' } }] }
+  };
+  const model = compactModelData(data);
+  assert.equal(model.members[0].sender, '群友(1)');
+  assert.equal(model.info.sender, '群友(2)');
+  assert.equal(model.info.text, '***');
+  assert.equal(model.groupMembers[0].nickname, '小明');
+  assert.equal(model.groupMembers[0].card, '群友(3)');
+  assert.equal(model.raw.sender.card, '群友(4)');
+  assert.equal(model.raw.sender.nickname, '普通');
+  assert.equal(model.raw.message[0].data.text, '***');
+});
 
 test('short messages retain identity and text once, including zero-valued timestamps', () => {
   assert.deepEqual(compactModelMessage({ ...shortMessage, time: 0 }), {
@@ -74,7 +122,7 @@ test('forwarded and legacy messages retain otherwise unresolvable media referenc
   assert.deepEqual(compact.media[1], message.media[1]);
 });
 
-test('self/owner flags, poke context and unknown extensions survive; only known empty values disappear', () => {
+test('bot messages lose erroneous owner identity; real owner and unrelated fields survive', () => {
   const message = {
     messageId: null, userId: null, text: '我来啦', plain: '我来啦',
     isSelf: true, isOwner: true, ownerLabel: '我', kind: 'poke',
@@ -84,9 +132,16 @@ test('self/owner flags, poke context and unknown extensions survive; only known 
   };
   const compact = compactModelMessage(message);
   assert.deepEqual(compact, {
-    text: '我来啦', isSelf: true, isOwner: true, ownerLabel: '我', kind: 'poke',
+    text: '我来啦', isSelf: true, kind: 'poke',
     poke: message.poke, extension: message.extension, futureFlag: false
   });
+  assert.equal(message.isOwner, true, 'the model view must not rewrite stored input');
+  assert.equal(message.ownerLabel, '我');
+  const ownerMessage = compactModelMessage({
+    userId: '123', text: '这是管理员的消息', isSelf: false, isOwner: true, ownerLabel: '管理员'
+  });
+  assert.equal(ownerMessage.isOwner, true, 'real owner messages retain their identity');
+  assert.equal(ownerMessage.ownerLabel, '管理员');
   for (const item of [null, undefined, 'string', 1, false, []]) {
     assert.equal(compactModelMessage(item), item);
   }
@@ -153,7 +208,7 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     // live config or user runtime state are copied into this test fixture.
     fixture = await fs.mkdtemp(path.join(ROOT, '.tmp-model-view-test-'));
     await fs.mkdir(path.join(fixture, 'src'));
-    await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js'].map((name) =>
+    await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'model-safety.js', 'sensitive.js'].map((name) =>
       fs.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
     await fs.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
     const transport = new StdioClientTransport({

@@ -6,6 +6,7 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { PiApiClient } from '../src/pi-client.js';
+import { MemoryStore } from '../src/memory-store.js';
 import { repairToolPairs, projectPiContext, terminalToolResult, piContent } from '../src/pi-context.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
@@ -18,21 +19,24 @@ const result = value => ({ content: [{ type: 'text', text: JSON.stringify(value)
 const toolName = 'mcp__snowluma__qq_send_message';
 const calls = [];
 let failSend = false;
-let permitFinish = true;
 let sends = 0;
 let paused;
 const server = http.createServer(async (req, res) => {
   const chunks = []; for await (const chunk of req) chunks.push(chunk);
   const body = JSON.parse(Buffer.concat(chunks).toString()); calls.push(body);
   assert.equal(req.headers.authorization, 'Bearer fixture-only-no-real-key');
-  assert.equal(body.enable_thinking, false);
-  assert.equal(body.max_tokens, 256);
+  if (body.model === 'gemini-3.8-flash') {
+    assert.equal(Object.hasOwn(body, 'enable_thinking'), false);
+    assert.equal(body.reasoning_effort, 'low');
+  } else assert.equal(body.enable_thinking, false);
+  const learning = body.model === 'learning-fixture';
+  assert.equal(body.max_tokens, learning ? 500 : 256);
   const isFollowUp = body.messages.at(-1)?.role === 'tool';
-  const delta = isFollowUp ? { role: 'assistant', content: 'done' } : { role: 'assistant', tool_calls: [{ index: 0, id: 'call_' + calls.length, type: 'function', function: { name: toolName, arguments: '{}' } }] };
+  const delta = learning ? { role: 'assistant', content: '[]' } : isFollowUp ? { role: 'assistant', content: 'done' } : { role: 'assistant', tool_calls: [{ index: 0, id: 'call_' + calls.length, type: 'function', function: { name: toolName, arguments: '{}' } }] };
   res.writeHead(200, { 'content-type': 'text/event-stream' });
-  const emit = (delta, finish_reason, usage) => res.write('data: ' + JSON.stringify({ id: 'test', object: 'chat.completion.chunk', model: 'qwen3.8-flash', choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) }) + '\n\n');
+  const emit = (delta, finish_reason, usage) => res.write('data: ' + JSON.stringify({ id: 'test', object: 'chat.completion.chunk', model: body.model, choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) }) + '\n\n');
   emit(delta, null);
-  emit({}, isFollowUp ? 'stop' : 'tool_calls', { prompt_tokens: 30, completion_tokens: 5, total_tokens: 35 });
+  emit({}, learning || isFollowUp ? 'stop' : 'tool_calls', { prompt_tokens: 30, completion_tokens: 5, total_tokens: 35 });
   res.end('data: [DONE]\n\n');
 });
 server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -41,7 +45,7 @@ process.env.QQ_PI_FIXTURE_KEY = 'fixture-other-project-key';
 fs.writeFileSync(config.credentialFile, 'QQ_PI_FIXTURE_KEY=fixture-only-no-real-key\n');
 const tool = { name: toolName, label: 'send', description: 'fixture tool', parameters: { type: 'object', properties: {}, additionalProperties: false }, execute: async () => {
   sends++; if (paused) await paused;
-  return { ...result({ ok: !failSend, failed: failSend ? 1 : 0, turnComplete: !failSend }), details: { bridgeTerminal: !failSend && permitFinish }, isError: failSend };
+  return { ...result({ ok: !failSend, failed: failSend ? 1 : 0, turnComplete: !failSend }), details: { bridgeTerminal: !failSend }, isError: failSend };
 } };
 function client(root = temp, overrides = {}) {
   const c = new PiApiClient({ root, config, tools: [tool], rolePrompt: () => 'fixture persona', ...overrides }); clients.push(c); return c;
@@ -64,7 +68,6 @@ try {
   fs.mkdirSync(path.join(temp, 'runtime', 'pi'), { recursive: true });
   fs.writeFileSync(path.join(temp, 'runtime', 'pi', 'package.json'), '{"type":"module"}');
   fs.copyFileSync(path.join(project, 'runtime', 'pi', 'sdk.js'), path.join(temp, 'runtime', 'pi', 'sdk.js'));
-  fs.copyFileSync(path.join(project, 'runtime', 'pi', 'system-prompt.md'), path.join(temp, 'runtime', 'pi', 'system-prompt.md'));
   fs.symlinkSync(path.join(project, 'runtime', 'pi', 'node_modules'), path.join(temp, 'runtime', 'pi', 'node_modules'), 'junction');
   const presetDir = path.join(temp, 'dsh', 'agent-presets', 'qq-chat-v2'); fs.mkdirSync(presetDir, { recursive: true });
   fs.writeFileSync(path.join(presetDir, 'agent.cordis.yml'), '- id: persona\n  config:\n    prefix: fixture safe preset\n');
@@ -102,10 +105,6 @@ try {
     assert.equal(end.reason.kind, 'completed');
     assert.equal(s.records.find(e => e.type === 'assistant/message').data.usage.inputTokens, 30);
   });
-  permitFinish = false; const controlId = await create(c); const beforeControl = calls.length;
-  await prompt(c, controlId);
-  check('successful send without finish decision needs a second provider request', () => assert.equal(calls.length - beforeControl, 2));
-  permitFinish = true;
   failSend = true; const beforeFailure = calls.length;
   await prompt(c, id);
   check('failed send is not treated as a completed reply', () => assert.equal(calls.length - beforeFailure, 2));
@@ -145,6 +144,43 @@ try {
     assert.equal(calls.length - beforeSerial, 2);
     assert.equal(c.loadSession(serial).messages.filter(m => m.role === 'user').length, 2);
   });
+  const gemini = client(temp, { config: { ...config, model: 'gemini-3.8-flash', thinkingLevel: 'low', compat: { thinkingFormat: 'openai' } } });
+  const geminiId = await create(gemini); const beforeGemini = calls.length;
+  await prompt(gemini, geminiId);
+  check('Gemini uses low reasoning without Qwen-specific request parameters', () => assert.equal(calls.length - beforeGemini, 1));
+  const memoryId = await create(c);
+  for (let n = 0; n < 2; n++) {
+    await c.sessions.prompt({ sessionId: memoryId, content: [{ type: 'text', text: 'remember fixture' }], bridgeMemory: { version: 'v1', text: 'fixture durable preference' } });
+    await c.loadSession(memoryId).runPromise;
+  }
+  check('actual SDK/wire keeps one memory snapshot across successive turns', () => {
+    assert.equal(JSON.stringify(calls.at(-1)).split('fixture durable preference').length - 1, 1);
+    assert.ok(c.loadSession(memoryId).messages.find(m => m.bridgeMemory?.version === 'v1'));
+    assert.equal(JSON.stringify(calls.at(-1)).includes('bridgeMemory'), false);
+  });
+  await c.sessions.prompt({ sessionId: memoryId, content: [{ type: 'text', text: 'correct fixture' }], bridgeMemory: { version: 'v2', text: 'fixture updated preference' } });
+  await c.loadSession(memoryId).runPromise;
+  check('actual SDK/wire immediately replaces outdated memory snapshot', () => {
+    assert.ok(JSON.stringify(calls.at(-1)).includes('fixture updated preference'));
+    assert.ok(!JSON.stringify(calls.at(-1)).includes('fixture durable preference'));
+  });
+  const learningStore = new MemoryStore({ dir: path.join(temp, 'learning-budget') });
+  try {
+    const learner = client(temp, { config: { ...config, model: 'learning-fixture' }, learningBudget: learningStore });
+    const workspace = unwrap(await learner.workspace.create({ path: path.join(temp, 'slang-agent') }), 'workspace').workspace;
+    const learnerId = unwrap(await learner.sessions.create({ workspaceId: workspace.workspaceId, agentPreset: 'qq-chat-v2' }), 'create').sessionId;
+    const beforeLearning = calls.length;
+    await prompt(learner, learnerId); await prompt(learner, learnerId);
+    await learner.sessions.prompt({ sessionId: learnerId, content: [{ type: 'text', text: 'over budget' }] });
+    await learner.loadSession(learnerId).runPromise;
+    check('actual SDK learner is stateless, output-capped and stopped before third paid request', () => {
+      assert.equal(calls.length - beforeLearning, 2);
+      assert.equal(calls.at(-1).messages.filter(m => m.role === 'user').length, 1);
+      assert.equal(calls.at(-1).max_tokens, 500);
+      assert.equal(learningStore.learningUsage().requests, 2);
+      assert.equal(learner.loadSession(learnerId).records.at(-1).data.reason.kind, 'error');
+    });
+  } finally { learningStore.close(); }
   const brokenRoot = path.join(temp, 'broken'); fs.mkdirSync(path.join(brokenRoot, 'state', 'pi'), { recursive: true });
   const brokenIndex = path.join(brokenRoot, 'state', 'pi', 'index.json'); fs.writeFileSync(brokenIndex, '{broken');
   check('corrupt history index fails closed without overwriting the archive', () => {

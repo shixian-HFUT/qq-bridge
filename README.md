@@ -2,7 +2,7 @@
 
 **English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
 
-> 本 fork 新增可选的 **Pi 后端与回复流程优化**：由桥接进程直接运行 Pi Agent，在成功发送并确认已读后结束本轮，省去发送后的收尾模型调用；后台观察新消息，避免空闲长轮询。DSH 后端仍保留为默认值。迁移、配置、边界和离线复现步骤见 [Pi 后端说明](docs/guides/PI_BACKEND.md)。
+> 本 fork **v0.3.1** 在可选 Pi 后端上增加有来源的长期记忆、图片检索与发送去重、群聊身份和后台观察、可选语音与稳定性修复。DSH 仍为默认后端。更新范围、配置、共享记忆边界与离线检查见 [本次更新说明](docs/guides/FORK_UPDATE_2026_10.md)；Pi 安装与迁移见 [Pi 后端说明](docs/guides/PI_BACKEND.md)。
 
 > 🗂️ 文档索引（全部文档一句话说明 + 是否仍然有效）见 **[docs/README.md](docs/README.md)**；仓库目录/脚本命名约定见 **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**。
 >
@@ -12,7 +12,7 @@
 
 把 QQ 消息接入 DSH agent：QQ 好友/群发来的消息会变成 DSH 会话里的用户消息，agent 的回复（含提问、工具审批）会发回 QQ。
 
-> ⚠️ **当前版本 `v0.2.0`，适配 DSH 0.2.0-rc.2**（在该版本上逐项实测：`npm run verify:adaptation`）。
+> ⚠️ **上游基线 `v0.2.0`，适配 DSH 0.2.0-rc.2**（在该版本上逐项实测：`npm run verify:adaptation`）。
 > 鉴权用 `~/.dsh` 里持久化的浏览器会话签名密钥**离线铸造 Cookie** —— DSH 0.1.7 起进程启动 token
 > 只存在于内存、不再落盘，旧版「从 guard 日志里读 token」的方式已失效。agent preset 是 DSH 0.1.7 起的
 > `@deepseek-ai/dsh-agent-preset` Cordis 行（`~/.dsh/.agent-presets/` 目录机制已废）。协议代次
@@ -35,7 +35,7 @@
 >
 > 本次更新的完整说明见 [**Release v0.2.0**](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.2.0)。
 >
-> 默认分支 `main` **就是**本版本，`git clone` 直接拿到，无需切换分支。
+> 本 fork 的 `main` 包含上述后续更新，原上游发布说明仅用于说明 DSH 适配基线。
 
 ```
 QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──► DSH Web API (127.0.0.1:3080/api)
