@@ -13,6 +13,11 @@ import { repairToolPairs, projectPiContext, terminalToolResult, piContent } from
 import { PiMediaStore } from './pi-media-store.js';
 import { PiMaintenance } from './pi-maintenance.js';
 import { ImageInputGuard, IMAGE_REJECTION_NOTICE } from './pi-image-rejection.js';
+import {
+  buildToolExposure, sanitizeTurnContext, shouldOfferFormatCorrection, redactToolArgumentsForRecord,
+  isActionToolName, simpleToolsEnabled, advanceTurnCursor, isCursorSourceTarget,
+  SIMPLE_TOOLS_PROMPT_NOTE, FORMAT_CORRECTION_TEXT, SIMPLE_CORRECTION_MAX_STREAK
+} from './simple-tools.js';
 
 const ok = value => ({ result: { ok: true, value } });
 const fail = (code, message) => ({ result: { ok: false, error: { code, message } } });
@@ -46,6 +51,8 @@ function credential(config) {
 export class PiApiClient {
   constructor({ root, config, rolePrompt = () => '', streamFn, tools, Agent, sdk, learningBudget } = {}) {
     this.learningBudget = learningBudget;
+    // 工具简写适配：只有显式 config.simpleTools=true 才启用，默认完全沿用旧行为。
+    this.simpleTools = simpleToolsEnabled(config);
     this.root = root;
     this.config = { credentialFile: path.join(root, '.env'), ...config };
     if (this.config.credentialFile && !path.isAbsolute(this.config.credentialFile)) this.config.credentialFile = path.resolve(root, this.config.credentialFile);
@@ -240,12 +247,15 @@ export class PiApiClient {
     s.selection = { provider, model, reasoningEffort: reasoningEffort || this.config.thinkingLevel || 'off' };
     this.record(s, 'model/selection', s.selection); return ok({ selected: s.selection });
   }
-  async prompt({ sessionId, content, requestId = randomUUID(), bridgeMemory, learningTask }) {
+  async prompt({ sessionId, content, requestId = randomUUID(), bridgeMemory, learningTask, turnContext }) {
     if (!this.index.sessions[sessionId] || this.index.sessions[sessionId].archived) return fail('session/not-found', 'Pi session not found');
     const s = this.loadSession(sessionId);
     // Bridge owns admission and replay; don't replay interrupted external effects.
     if (this.disposed) return fail('session/stopped', 'Pi runtime is stopped');
-    s.queue.push({ content: piContent(content), requestId, bridgeMemory, learningTask });
+    // Trusted per-turn binding for simplified tools. Only the bridge can supply
+    // this; it is never derived from prompt text or the model's arguments.
+    s.queue.push({ content: piContent(content), requestId, bridgeMemory, learningTask,
+      turnContext: sanitizeTurnContext(turnContext) });
     this.startDrain(s);
     return ok({ accepted: true, requestId });
   }
@@ -277,25 +287,74 @@ export class PiApiClient {
           systemPrompt += '\n【当前聊天分寸】角色卡保留身份与语气。有人找你、回应你、分享日常或开玩笑时，自然接住，不必等正式问题。有兴趣可以接梗、表达感受或顺着问一句，不把追问当每次结尾。长短随内容，不强行压成一个短语，也不把一件小事扩成讲道理、分析心理或生活指导。能自然加入的群聊可以参与；确实无关、重复或已经结束时可以安静。不按最近发言数量要求自己沉默。';
           systemPrompt += '\n角色卡中的回复示例只示意语气，不是真实聊天记忆。没有实际消息或记忆依据，不说“我记得你昨天”“之前听你说过”，不替对方补经历。';
         }
+        // With the switch on, chat turns always get the simplified contract.
+        // A missing/stale trusted context must fail closed inside each tool call,
+        // never silently fall back to model-supplied key/token. Learner sessions
+        // keep their historical stateless behaviour.
+        const turnContext = item.turnContext || null;
+        const simpleTurn = this.simpleTools === true && !isLearner;
+        // Only ordinary chat wakes get the "reply with send(...)" note; internal
+        // summary/reminder turns must not be nudged toward speaking.
+        if (simpleTurn && turnContext?.kind === 'chat-wake') systemPrompt += SIMPLE_TOOLS_PROMPT_NOTE;
         const definitions = isLearner ? (item.learningTask === 'slang-research' ? this.toolDefinitions.filter(t => t.name.startsWith('mcp__web-search-safe__')) : []) : this.toolDefinitions;
+        const exposures = buildToolExposure(definitions, { enabled: simpleTurn, turn: turnContext });
+        // Model-facing name -> canonical MCP name: records and bridge-side send
+        // detection keep using the historical names, so existing audit/dedup logic
+        // is unchanged even when the model called `send`.
+        const canonicalNames = new Map(exposures.map(tool => [tool.name, tool.canonical]));
         s.pendingImageJobs ||= {};
-        const tools = definitions.map(tool => ({ ...tool, execute: async (callId, args, signal, ...rest) => {
-          if (tool.name.endsWith('__qq_image_job')) {
-            const last = s.pendingImageJobs[args.jobId]?.lastQueryAt || 0;
-            const remaining = Math.max(0, 20000 - (Date.now() - last));
-            if (remaining) await delay(remaining, undefined, { signal });
+        // Only the simplified path keeps correction bookkeeping. With the switch
+        // off nothing new is written into the session archive (default behaviour).
+        if (simpleTurn && (!s.simpleCorrections || typeof s.simpleCorrections !== 'object')) s.simpleCorrections = { source: null, streak: 0 };
+        // Image jobs created/touched *in this turn*. Old pending jobs from earlier
+        // turns must not suppress termination or correction for an unrelated new chat.
+        const turnImageJobs = new Set();
+        const rememberTurnJob = id => { if (id !== undefined && id !== null && id !== '') turnImageJobs.add(String(id)); };
+        const forgetTurnJob = id => { if (id !== undefined && id !== null) turnImageJobs.delete(String(id)); };
+        const hasTurnPendingJobs = () => [...turnImageJobs].some(id => s.pendingImageJobs[id]);
+        // Simplified turns only consider image jobs created/continued *this* turn;
+        // with the switch off the historical "any pending job blocks the terminal
+        // shortcut" rule is kept verbatim so default behaviour does not change.
+        const pendingJobBlocksEnd = () => (simpleTurn ? hasTurnPendingJobs() : Object.keys(s.pendingImageJobs).length > 0);
+        let actionAttempted = false, hadToolError = false, correctionUsed = false;
+        const tools = exposures.map(tool => ({
+          name: tool.name, label: tool.label, description: tool.description, parameters: tool.parameters,
+          execute: async (callId, rawArgs, signal, ...rest) => {
+            const canonical = tool.canonical;
+            // Bound arguments replace any model-supplied key/token/throughSeq and
+            // fail closed when no trusted context exists.
+            const args = tool.bindArgs ? tool.bindArgs(rawArgs) : rawArgs;
+            if (canonical.endsWith('__qq_image_job')) {
+              const last = s.pendingImageJobs[args.jobId]?.lastQueryAt || 0;
+              const remaining = Math.max(0, 20000 - (Date.now() - last));
+              if (remaining) await delay(remaining, undefined, { signal });
+            }
+            const result = await tool.execute(callId, args, signal, ...rest);
+            const data = resultData(result);
+            // A read/wait result may show the model newer messages: allow the
+            // bound cursor to advance to *that* readThroughSeq only (monotonic,
+            // never the global unread set and never a model-supplied number).
+            if (!result.isError && isCursorSourceTarget(tool.target) && data?.ok !== false) {
+              advanceTurnCursor(turnContext, data?.readThroughSeq);
+            }
+            if (!result.isError && data?.ok && data.jobId) {
+              if (canonical.endsWith('__qq_generate_image') || canonical.endsWith('__qq_image_job')) {
+                rememberTurnJob(data.jobId);
+                if (data.status === 'failed' || data.sent === 'sent') { forgetTurnJob(data.jobId); delete s.pendingImageJobs[data.jobId]; }
+                else s.pendingImageJobs[data.jobId] = { lastQueryAt: Date.now() };
+              } else if (canonical.endsWith('__qq_send_generated_image') && data.sent === 'sent') {
+                forgetTurnJob(data.jobId);
+                delete s.pendingImageJobs[data.jobId];
+              }
+              this.saveSession(s);
+            }
+            if (simpleTurn && !result.isError && data?.ok !== false && isActionToolName(canonical)) {
+              // A successful action resets the bounded-correction streak.
+              s.simpleCorrections = { ...s.simpleCorrections, streak: 0 };
+            }
+            return result;
           }
-          const result = await tool.execute(callId, args, signal, ...rest);
-          const data = resultData(result);
-          if (!result.isError && data?.ok && data.jobId) {
-            if (tool.name.endsWith('__qq_generate_image') || tool.name.endsWith('__qq_image_job')) {
-              if (data.status === 'failed' || data.sent === 'sent') delete s.pendingImageJobs[data.jobId];
-              else s.pendingImageJobs[data.jobId] = { lastQueryAt: Date.now() };
-            } else if (tool.name.endsWith('__qq_send_generated_image') && data.sent === 'sent') delete s.pendingImageJobs[data.jobId];
-            this.saveSession(s);
-          }
-          return result;
-        } }));
+        }));
         let calls = 0, learningRequest = null;
         const stream = this.streamOverride || this.models.streamSimple.bind(this.models);
         const agent = s.agent = new this.Agent({
@@ -313,8 +372,32 @@ export class PiApiClient {
           transformContext: async messages => this.mediaStore.hydrateMessages(imageGuard.project(projectPiContext(messages, this.config.contextBudgetTokens || 24000))),
           finishTurn: ({ message, toolResults }) => {
             if (message.stopReason === 'error' || message.stopReason === 'aborted') return;
-            if (Object.keys(s.pendingImageJobs).length) return;
+            if (pendingJobBlocksEnd()) return;
             if (toolResults.length && toolResults.every(r => !r.isError && r.details?.bridgeTerminal === true)) return { action: 'end' };
+            // Bounded format correction for ordinary chat wakes only. Internal
+            // summary/console turns (`silent`) and other system prompts must never
+            // be corrected into sending or marking read. One chance per turn, at
+            // most SIMPLE_CORRECTION_MAX_STREAK consecutive times per source event;
+            // a new source (new messages / a fresh @) gets a fresh bounded chance.
+            if (!simpleTurn || turnContext?.kind !== 'chat-wake') return;
+            const source = turnContext.sourceId || null;
+            if (source && s.simpleCorrections.source !== source) {
+              s.simpleCorrections = { source, streak: 0 };
+            }
+            const text = (message.content || []).filter(c => c.type === 'text').map(c => String(c.text ?? '')).join('');
+            const allowed = shouldOfferFormatCorrection({
+              actionAttempted, hadToolError, usedThisTurn: correctionUsed, text,
+              streak: Number(s.simpleCorrections?.streak) || 0,
+              maxStreak: SIMPLE_CORRECTION_MAX_STREAK,
+              callsLeft: (Number(this.config.maxCallsPerTurn) || 12) - calls,
+            });
+            if (!allowed) return;
+            correctionUsed = true;
+            s.simpleCorrections = { ...s.simpleCorrections, streak: (Number(s.simpleCorrections?.streak) || 0) + 1 };
+            this.record(s, 'turn/correction', { turn, step, reason: 'text-only-without-action' });
+            try {
+              agent.followUp({ role: 'user', content: [{ type: 'text', text: FORMAT_CORRECTION_TEXT }], timestamp: Date.now() });
+            } catch { /* a failed follow-up must not turn a completed turn into an error */ }
           },
         });
         agent.subscribe(event => {
@@ -328,8 +411,16 @@ export class PiApiClient {
             this.record(s, 'assistant/message', { turn, step, message: { content: m.content.filter(c => c.type === 'text') }, usage });
             if (m.stopReason === 'error') lastError = m.errorMessage || 'Pi provider error';
           } else if (event.type === 'tool_execution_start') {
-            this.record(s, 'tool/call', { turn, step, callId: event.toolCallId, name: event.toolName, arguments: event.args });
+            if (isActionToolName(event.toolName)) actionAttempted = true;
+            // Only the simplified path rewrites the recorded name or redacts
+            // arguments; with the switch off the historical `mcp__snowluma__*`
+            // names and argument records stay byte-identical so bridge-side send
+            // detection and archives do not change behaviour.
+            const recordedName = simpleTurn ? (canonicalNames.get(event.toolName) ?? event.toolName) : event.toolName;
+            const recordedArgs = simpleTurn ? redactToolArgumentsForRecord(event.args) : event.args;
+            this.record(s, 'tool/call', { turn, step, callId: event.toolCallId, name: recordedName, arguments: recordedArgs });
           } else if (event.type === 'tool_execution_end') {
+            if (event.isError) hadToolError = true;
             this.mediaStore.externalizeContent(event.result.content);
             this.record(s, 'tool/result', { turn, step, message: { source: { callId: event.toolCallId }, content: event.result.content, isError: event.isError } });
           } else if (event.type === 'turn_end') this.record(s, 'step/end', { turn, step });

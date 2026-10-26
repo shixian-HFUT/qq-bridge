@@ -56,6 +56,7 @@
     "harden-acl": "node scripts/harden-state-acl.mjs",
     "setup:pi": "npm --prefix runtime/pi ci --ignore-scripts --no-audit --no-fund",
     "test:pi": "node scripts/test-pi-runtime.mjs && node scripts/test-reply-flow.mjs",
+    "test:simple-tools": "node scripts/test-simple-tools.mjs && node scripts/test-simple-tools-bridge.mjs && node scripts/test-pi-simple-tools.mjs",
     "test:features": "node scripts/test-features.mjs",
     "check:pi-maintenance": "node scripts/check-pi-maintenance.mjs",
     "backfill:image-outbox": "node scripts/backfill-image-outbox.mjs"

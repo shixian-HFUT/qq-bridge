@@ -3,6 +3,8 @@
 **English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
 
 > 本 fork **v0.3.1** 在可选 Pi 后端上增加有来源的长期记忆、图片检索与发送去重、群聊身份和后台观察、可选语音与稳定性修复。DSH 仍为默认后端。更新范围、配置、共享记忆边界与离线检查见 [本次更新说明](docs/guides/FORK_UPDATE_2026_10.md)；Pi 安装与迁移见 [Pi 后端说明](docs/guides/PI_BACKEND.md)。
+>
+> 🧪 另有一个**默认关闭**的实验性开关 `pi.simpleTools`：让 Pi 后端把 QQ 工具改成短名 + 自然文字参数，会话 key/令牌/已读水位由桥接按当轮可信上下文绑定。适用边界、成本与回滚见 [工具简写说明](docs/guides/SIMPLE_TOOLS.md)。
 
 > 🗂️ 文档索引（全部文档一句话说明 + 是否仍然有效）见 **[docs/README.md](docs/README.md)**；仓库目录/脚本命名约定见 **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**。
 >
@@ -123,6 +125,7 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `sendDelayMs` | QQ 连续发送间隔，防止触发频率限制 |
 | `consolePort` | 本地控制台端口，默认 `3100` |
 | `consoleToken` | 控制台访问令牌；留空时启动自动生成并保存到 `state/console-token` |
+| `pi.simpleTools` | **仅 Pi 后端**，默认 `false`。实验性工具简写：模型用短名与自然文字参数（`send(text=...)`），会话 key/令牌/已读水位由桥接按当轮可信上下文绑定。适用边界、成本与回滚见 [docs/guides/SIMPLE_TOOLS.md](docs/guides/SIMPLE_TOOLS.md) |
 
 > ⚠️ `allowAllWhenEmpty: true` 表示「白名单没填就全部放行」——把 agent 接入 QQ 等于把账号控制权交给了模型，建议先填白名单。
 
@@ -219,6 +222,12 @@ npm run test:audit
 ```
 
 reserved2 的 token 开销优化、消息水位协议、升级及回退说明（该专项分析为本地文档，未随仓库发布。）专项离线回归可运行 `npm run test:token`，已包含在上面的完整回归中。
+
+实验性工具简写的专项离线回归（纯函数 + 真实 Pi SDK + 假 provider + 假执行器，不连 QQ、不调真实模型）：
+
+```bash
+npm run test:simple-tools
+```
 
 控制台「令牌与花费」看板的账本与价目表回归（峰谷分时、幂等折叠、基线合并、压缩与容错）：
 

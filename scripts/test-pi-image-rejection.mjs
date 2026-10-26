@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { once } from 'node:events';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { PiApiClient } from '../src/pi-client.js';
 import { ImageInputGuard, isInputImageRejection, IMAGE_REJECTION_NOTICE } from '../src/pi-image-rejection.js';
@@ -89,8 +89,15 @@ test('actual SDK: no retry; legacy failure recovers across restart; text and fre
   try {
     fs.mkdirSync(path.join(temp, 'runtime', 'pi'), { recursive: true });
     fs.writeFileSync(path.join(temp, 'runtime', 'pi', 'package.json'), '{"type":"module"}');
-    fs.copyFileSync(path.join(project, 'runtime', 'pi', 'sdk.js'), path.join(temp, 'runtime', 'pi', 'sdk.js'));
-    fs.symlinkSync(path.join(project, 'runtime', 'pi', 'node_modules'), path.join(temp, 'runtime', 'pi', 'node_modules'), 'junction');
+    // 部分沙箱禁止在临时目录创建 junction（清理阶段 unlink 会 EPERM，测试假失败）；
+    // 改用绝对 file URL 引用同一份锁定依赖，断言与运行时行为不变。
+    const piRoot = path.join(project, 'runtime', 'pi', 'node_modules', '@earendil-works');
+    fs.writeFileSync(path.join(temp, 'runtime', 'pi', 'sdk.js'), [
+      `export { Agent } from ${JSON.stringify(pathToFileURL(path.join(piRoot, 'pi-agent-core', 'dist', 'index.js')).href)};`,
+      `export { createModels } from ${JSON.stringify(pathToFileURL(path.join(piRoot, 'pi-ai', 'dist', 'models.js')).href)};`,
+      `export { openAICompletionsApi } from ${JSON.stringify(pathToFileURL(path.join(piRoot, 'pi-ai', 'dist', 'api', 'openai-completions.lazy.js')).href)};`,
+      ''
+    ].join('\n'));
     const preset = path.join(temp, 'dsh', 'agent-presets', 'qq-chat-v2');
     fs.mkdirSync(preset, { recursive: true });
     fs.writeFileSync(path.join(preset, 'agent.cordis.yml'), '- id: persona\n  config:\n    prefix: fixture\n');

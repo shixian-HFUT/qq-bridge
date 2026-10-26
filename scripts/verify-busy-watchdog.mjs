@@ -141,7 +141,7 @@ function verifyHarness({ config = {}, transformSource } = {}) {
   const modelSafetySource = fs.readFileSync(path.join(root, 'src/model-safety.js'), 'utf8').replace(/^export /gm, '');
   vm.runInContext(`Object.assign(globalThis, (() => { ${modelSafetySource}\nreturn { containsUnsafeModelText, maskModelText, safeModelDisplayName }; })());`, context);
   const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8')
-    .replace(/^import[^\n]*;\n/gm, '')
+    .replace(/^import[^\n]*;\r?\n/gm, '')
     .replace(/^export /gm, '');
   vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData }; })());`, context);
   vm.runInContext(source + '\nglobalThis.verifyReady = main();', context);

@@ -25,6 +25,7 @@ import * as stateAcl from '../src/state-acl.mjs';
 import { inFlightTurnEvents } from '../src/in-flight-turns.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 import * as roleCard from '../src/role-card.js';
+import * as simpleTools from '../src/simple-tools.js';
 import { MemoryStore, LONG_MEMORY_KINDS } from '../src/memory-store.js';
 import { ImageOutbox } from '../src/image-outbox.js';
 
@@ -117,6 +118,7 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
     evaluateWakeTriggerV2, scheduleReplyCheckV2,
     pumpMux, pendingWakeKeys, wakeConfigMissCount,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildPiTurnContextV2,
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
@@ -142,7 +144,7 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector, inFlightTurnEvents,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ImageOutbox,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...roleCard,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...roleCard, ...simpleTools,
     MemoryStore, LONG_MEMORY_KINDS,
     LocalImages: class {}, // no local generation process in HTTP/flow fixtures
     isVoiceRequest, VoiceRequestStore, runVoiceAction, loadTtsConfig, validateSpeech, ...voiceCadence,
@@ -174,7 +176,9 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
   const modelSafetySource = fs.readFileSync(path.join(root, 'src/model-safety.js'), 'utf8').replace(/^export /gm, '');
   vm.runInContext(`Object.assign(globalThis, (() => { ${modelSafetySource}\nreturn { containsUnsafeModelText, maskModelText, safeModelDisplayName }; })());`, context);
   const modelViewSource = fs.readFileSync(path.join(root, 'src/qq-model-view.js'), 'utf8')
-    .replace(/^import[^\n]*;\n/gm, '')
+    // \r? 是必需的：CRLF 工作树（Windows 自动换行 / core.autocrlf）下少匹配一个 \r
+    // 就会把 `import { ... } from './model-safety.js';` 留在 VM 源码里，直接 SyntaxError。
+    .replace(/^import[^\n]*;\r?\n/gm, '')
     .replace(/^export /gm, '');
   vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData }; })());`, context);
   vm.runInContext(source + '\nglobalThis.auditReady = main();', context);

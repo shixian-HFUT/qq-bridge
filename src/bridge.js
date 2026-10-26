@@ -63,6 +63,7 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+import { simpleToolsEnabled } from './simple-tools.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -10811,9 +10812,13 @@ async function main() {
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     if (opts.farewell) social.exitingSessions.add(sessionId);
+    // 简化工具只在显式开关下传上下文；开关关闭时请求体与旧版完全一致。
+    const piTurnContext = api.backend === 'pi' && simpleToolsEnabled(cfg.pi)
+      ? buildPiTurnContextV2(key, wakeSnapshot, opts) : null;
     let accepted;
     try {
       accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content,
+        ...(api.backend === 'pi' && piTurnContext ? { turnContext: piTurnContext } : {}),
         ...(api.backend === 'pi' && currentMode === 'reserved2' ? { bridgeMemory: memoryContextV3(key) } : {}) });
     } catch (error) {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
@@ -11850,6 +11855,48 @@ async function main() {
       packet.recent.reverse();
     }
     return packet;
+  }
+
+  // ── 工具简写适配：当轮可信会话上下文 ─────────────────────────────────────
+  //
+  // Pi 后端在 config.pi.simpleTools=true 时会把 key/令牌/已读水位从工具参数里
+  // 去掉，改由运行时绑定。绑定源必须来自桥接自己的会话状态，绝不能来自提示文本
+  // 或模型参数：
+  //   · key      = 本次投递的会话（ensureSession 已校验模式/白名单）；
+  //   · token    = 该会话当前的 agentToken（每次调用仍会被桥接逐次校验）；
+  //   · 水位     = 本次真正展示给模型的快照水位；没有快照时退回“已展示过的最大水位”；
+  //   · 原消息ID = 快照里最后一条非自己发的消息（仅用于缺省时补 requestId）；
+  //   · kind     = chat-wake（普通聊天唤醒）/ silent（摘要投喂、控制台后台提醒）/
+  //                internal（其它系统提示）。格式纠正只允许 chat-wake，内部回合
+  //                不能被纠正成发送或标记已读；
+  //   · sourceId = 本次唤醒的来源事件（wakeSeq 或展示水位）。纠正预算按来源收敛，
+  //                新的真实 @/新消息会得到新的有界纠正机会。
+  // 这个上下文对象只作为桥接→Pi 的内存参数传递：它本身不会被序列化进提示正文、
+  // 日志或会话存档。注意这不代表“提示里从不出现令牌”——既有的二代唤醒提示
+  // （buildWakePromptV2）本来就会展示会话令牌给模型，供历史长名调用手填；开启简写
+  // 后模型不必再抄它，但旧提示文案不因此改变。
+  function buildPiTurnContextV2(key, snapshot, opts = {}) {
+    const st = getSocialV2State(key);
+    const token = st?.agentToken;
+    if (!token) return null;
+    const displayed = snapshot && Number.isSafeInteger(snapshot.readThroughSeq)
+      ? snapshot.readThroughSeq : readThroughSeqV2(st);
+    let requestMessageId = null;
+    const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (!message || message.isSelf) continue;
+      if (message.messageId === undefined || message.messageId === null || String(message.messageId) === '') continue;
+      requestMessageId = String(message.messageId);
+      break;
+    }
+    const kind = opts.silent ? 'silent' : (opts.wakeReason ? 'chat-wake' : 'internal');
+    let sourceId = null;
+    if (kind === 'chat-wake') {
+      const seq = Number(opts.wakeSeq);
+      sourceId = `wake:${Number.isSafeInteger(seq) && seq >= 0 ? seq : displayed}`;
+    }
+    return { key, token, mode: currentMode, kind, sourceId, readThroughSeq: displayed, requestMessageId };
   }
 
   function replyTimingV2(st) {

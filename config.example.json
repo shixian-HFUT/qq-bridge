@@ -12,6 +12,9 @@
     "authPrefix": "Bearer",
     "allowRemote": false
   },
+  "pi": {
+    "simpleTools": false
+  },
   "role": {
     "maxInjectChars": 6000
   },

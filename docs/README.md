@@ -9,7 +9,7 @@
 
 ## guides/ —— 面向使用者 / 运维
 
-本 fork 新增：[Pi 后端与回复流程优化](guides/PI_BACKEND.md)，含安装、配置、回滚和离线对照验证。
+本 fork 新增：[Pi 后端与回复流程优化](guides/PI_BACKEND.md)，含安装、配置、回滚和离线对照验证；[可选工具简写 `pi.simpleTools`](guides/SIMPLE_TOOLS.md)（默认关闭，实验性）。
 
 | 文档 | 一句话说明 | 状态 |
 | --- | --- | --- |
@@ -19,6 +19,7 @@
 | [guides/TOKEN_USAGE_CONSOLE.md](guides/TOKEN_USAGE_CONSOLE.md) | 控制台「令牌与花费」看板：数据来源、计价口径（峰谷分时）、API、配置 | ✅ |
 | [guides/CONSOLE-UI-TESTING.md](guides/CONSOLE-UI-TESTING.md) | 控制台离线预览（`npm run preview:console`）与离线浏览器回归（`npm run test:console-ui`）怎么用 | ✅ 2026 整理时自 `scripts/` 移入 |
 | [guides/SECURITY_BASELINE.md](guides/SECURITY_BASELINE.md) | **安全基线与威胁模型**：威胁主体、已实现的边界（准入/工具面/出站/控制台/落盘/网络）、已知残余风险、发布前回归清单、改动检查单 | ✅ **改动安全相关代码前必读**（2026-09-20 新增） |
+| [guides/SIMPLE_TOOLS.md](guides/SIMPLE_TOOLS.md) | **可选工具简写**（`pi.simpleTools`，默认关闭、实验性）：短名与自然文字参数、可信当轮绑定与失败关闭、工具表与纠正请求的成本、适用模式与回滚、离线回归 | 🧪 实验性；只影响 Pi 后端，默认行为不变 |
 
 ## design/ —— 设计与规划（读设计意图用）
 
