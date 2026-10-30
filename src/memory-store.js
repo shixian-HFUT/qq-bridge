@@ -1,5 +1,10 @@
-// Hermes-inspired bounded curated memory + searchable transcripts. Independent
-// implementation for QQ: source-bound facts, shared notes and private raw history.
+// Bounded curated memory + searchable transcripts for QQ: source-bound facts,
+// shared notes and private raw history. The store layout and the batch
+// all-or-nothing write path were adapted from Hermes Agent
+// tools/memory_tool_store.py (MIT, Copyright (c) 2025 Nous Research, upstream
+// commit 337f3744; see third_party/hermes-agent/LICENSE). The merge /
+// consolidation-family bookkeeping and forget-family blocking below are
+// DSH-original additions for multi-user QQ memory.
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -35,6 +40,10 @@ export class MemoryStore {
         id TEXT NOT NULL, revision INTEGER NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL,
         at INTEGER NOT NULL, PRIMARY KEY(id, revision));
       CREATE TABLE IF NOT EXISTS memory_evidence (memory_id TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(memory_id, source_id));
+      CREATE TABLE IF NOT EXISTS memory_merges (
+        survivor_id TEXT NOT NULL, merged_id TEXT NOT NULL, merged_revision INTEGER NOT NULL,
+        merged_fingerprint TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY(survivor_id, merged_id));
+      CREATE INDEX IF NOT EXISTS memory_merges_merged ON memory_merges(merged_id);
       CREATE TABLE IF NOT EXISTS memory_forget_sources (source_id TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL,
         scope TEXT NOT NULL, PRIMARY KEY(source_id,kind,subject,scope));
       CREATE TABLE IF NOT EXISTS memory_forget_fingerprints (fingerprint TEXT PRIMARY KEY);
@@ -96,32 +105,28 @@ export class MemoryStore {
       .get(key, String(sourceId), String(sourceId));
   }
   visible(row, key, admin) { return admin || row.scope === 'shared' || row.scope === key; }
-  apply({ key, operations, admin = false, shared = false }) {
+  apply({ key, operations, admin = false, shared = false, ownerQQ = null }) {
     if (!keyOK(key)) throw Error('非法会话');
     if (!Array.isArray(operations) || !operations.length || operations.length > 8) throw Error('记忆操作应为 1–8 条');
-    return this.transaction(() => operations.map(op => this.applyOne(key, op, { admin, shared })));
+    return this.transaction(() => operations.map(op => this.applyOne(key, op, { admin, shared, ownerQQ })));
   }
-  applyOne(key, op, { admin, shared }) {
+  applyOne(key, op, { admin, shared, ownerQQ }) {
     const action = op.action || 'add';
-    if (!['add', 'patch', 'remove'].includes(action)) throw Error('非法记忆动作');
+    if (!['add', 'patch', 'remove', 'merge'].includes(action)) throw Error('非法记忆动作');
+    if (action === 'merge') return this.applyMerge(key, op, { admin, ownerQQ });
     const old = op.id ? this.db.prepare('SELECT * FROM memories WHERE id=?').get(String(op.id)) : null;
+    // 管理员本人在私聊里可以管理「关于他自己」的跨会话记忆（群写入的本人事实）。
+    // 例外只在 key === private:ownerQQ 时成立，且只按 subject 匹配本人，不放开别人。
+    const ownerScope = (!admin && ownerQQ != null && String(key) === 'private:' + String(ownerQQ)) ? String(ownerQQ) : null;
+    const ownFact = ownerScope !== null && old && String(old.subject) === ownerScope;
     if (action !== 'add') {
-      if (!old || !this.visible(old, key, admin) || (!admin && old.origin !== key)) throw Error('无权修改该记忆');
+      if (!old || !(this.visible(old, key, admin) || ownFact) || (!admin && !ownFact && old.origin !== key)) throw Error('无权修改该记忆');
       if (!Number.isInteger(op.revision) || op.revision !== old.revision) throw Error('版本冲突，请重新查询');
       if (old.status === 'forgotten') throw Error('记忆已忘记');
-      if (action === 'remove') {
-        for (const version of [...this.db.prepare('SELECT content FROM memory_revisions WHERE id=?').all(old.id), old]) {
-          const hash = digest(JSON.stringify([old.kind, old.subject, version.content, old.scope]));
-          this.db.prepare('INSERT OR IGNORE INTO memory_forget_fingerprints VALUES (?)').run(hash);
-        }
-        const sources = this.db.prepare('SELECT source_id FROM memory_evidence WHERE memory_id=?').all(old.id);
-        if (old.source_id) sources.push({ source_id: old.source_id });
-        for (const src of sources) this.db.prepare('INSERT OR IGNORE INTO memory_forget_sources VALUES (?,?,?,?)').run(src.source_id, old.kind, old.subject, old.scope);
-        this.db.prepare("UPDATE memories SET content='', status='forgotten', revision=revision+1, updated_at=? WHERE id=?").run(Date.now(), old.id);
-        // Revisions are for correction review; forget removes their plaintext.
-        this.db.prepare('DELETE FROM memory_revisions WHERE id=?').run(old.id);
-        return { id: old.id, revision: old.revision + 1, status: 'forgotten' };
-      }
+      // A merged entry no longer owns its body: editing it would resurrect text
+      // that was absorbed by the survivor (and later fell under its forget marker).
+      if (old.status === 'merged') throw Error('记忆已合并到其它条目，请修改保留条目');
+      if (action === 'remove') return this.forgetFamily(old);
     }
     const kind = old?.kind || op.kind;
     if (!LONG_MEMORY_KINDS.includes(kind)) throw Error('类别必须是 userFact / event / lesson');
@@ -129,12 +134,12 @@ export class MemoryStore {
     if (content.length > 240) throw Error('长期记忆单条最多240字，请概括后保存');
     if (!content || blocked.test(content)) throw Error('记忆为空或含指令/凭据内容');
     const source = this.source(key, op.sourceMessageId);
-    if (!admin && !source) throw Error('需要当前会话中真实收到的 sourceMessageId');
+    if (!admin && !ownFact && !source) throw Error('需要当前会话中真实收到的 sourceMessageId');
     const subject = old?.subject || clean(op.subject || source?.uid || '', 24);
     if (subject && !/^\d{5,12}$/.test(subject)) throw Error('人物主体必须是 QQ 号');
     // Only an actual author may establish their own durable profile. Other
     // observations are events/lessons, never self-confirmed profile facts.
-    if (kind === 'userFact' && (!subject || (!admin && source.uid !== subject))) throw Error('人物事实需要本人消息作为来源');
+    if (kind === 'userFact' && (!subject || (!admin && !ownFact && source?.uid !== subject))) throw Error('人物事实需要本人消息作为来源');
     const evidence = admin ? 'admin' : kind === 'userFact' ? 'self-report' : 'observation';
     const scope = old?.scope || (shared ? 'shared' : key);
     const fingerprint = digest(JSON.stringify([kind, subject, content, scope]));
@@ -160,10 +165,123 @@ export class MemoryStore {
     if (source) this.db.prepare('INSERT OR IGNORE INTO memory_evidence VALUES (?,?)').run(id, source.id);
     return { id, revision: 1, status: 'active' };
   }
-  list({ key, admin = false, query = '', kind, limit = 20, candidates = false, subjects }) {
+  // A merge is a consolidation, not a user "forget": the absorbed entries get
+  // their own status and a link to the survivor, and no forget marker is
+  // written. Their bodies/revisions stay auditable until the survivor itself is
+  // removed, at which point forgetFamily() blocks the whole family.
+  applyMerge(key, op, { admin, ownerQQ = null }) {
+    const survivor = this.db.prepare('SELECT * FROM memories WHERE id=?').get(String(op.id || ''));
+    const ownFact = !admin && ownerQQ != null && String(key) === 'private:' + String(ownerQQ)
+      && survivor && String(survivor.subject) === String(ownerQQ);
+    if (!survivor || !(this.visible(survivor, key, admin) || ownFact) || (!admin && !ownFact && survivor.origin !== key)) throw Error('无权修改该记忆');
+    if (!Number.isInteger(op.revision) || op.revision !== survivor.revision) throw Error('版本冲突，请重新查询');
+    if (survivor.status === 'forgotten') throw Error('记忆已忘记');
+    if (survivor.status !== 'active') throw Error('只能合并有效记忆');
+    if (!Array.isArray(op.from) || !op.from.length || op.from.length > 8) throw Error('合并来源应为 1–8 条');
+    const seen = new Set([survivor.id]);
+    const absorbed = [];
+    for (const item of op.from) {
+      if (!item || typeof item !== 'object') throw Error('合并来源格式错误');
+      const id = String(item.id || '');
+      if (!id || seen.has(id)) throw Error('合并来源必须是不同的其它条目');
+      seen.add(id);
+      const row = this.db.prepare('SELECT * FROM memories WHERE id=?').get(id);
+      if (!row || (!this.visible(row, key, admin) && !ownFact)) throw Error('合并来源不存在或不可见');
+      if (!Number.isInteger(item.revision) || item.revision !== row.revision) throw Error('版本冲突，请重新查询');
+      if (row.status === 'forgotten') throw Error('记忆已忘记');
+      if (row.status !== 'active') throw Error('只能合并有效记忆');
+      // Consolidation never crosses a person, a conversation/scope, or a kind:
+      // doing so would let one group's evidence rewrite another's record.
+      if (row.origin !== survivor.origin || row.scope !== survivor.scope
+        || row.kind !== survivor.kind || row.subject !== survivor.subject) throw Error('只能合并同一来源、范围、类别和人物的记忆');
+      absorbed.push(row);
+    }
+    const kind = survivor.kind, subject = survivor.subject, scope = survivor.scope;
+    const content = clean(op.content, 10000);
+    if (content.length > 240) throw Error('长期记忆单条最多240字，请概括后保存');
+    if (!content || blocked.test(content)) throw Error('记忆为空或含指令/凭据内容');
+    const source = this.source(key, op.sourceMessageId);
+    if (!admin && !ownFact && !source) throw Error('需要当前会话中真实收到的 sourceMessageId');
+    if (kind === 'userFact' && (!subject || (!admin && !ownFact && source?.uid !== subject))) throw Error('人物事实需要本人消息作为来源');
+    const fingerprint = digest(JSON.stringify([kind, subject, content, scope]));
+    if (!admin && (this.db.prepare('SELECT 1 FROM memory_forget_fingerprints WHERE fingerprint=?').get(fingerprint)
+      || (source && this.db.prepare('SELECT 1 FROM memory_forget_sources WHERE source_id=? AND kind=? AND subject=? AND scope=?').get(source.id, kind, subject, scope)))) throw Error('该内容或来源已忘记；不能自动重新写入');
+    if (this.db.prepare("SELECT 1 FROM memories WHERE fingerprint=? AND status='active' AND id<>? LIMIT 1").get(fingerprint, survivor.id)) throw Error('合并后的正文与已有有效记忆重复');
+    const now = Date.now();
+    this.db.prepare('INSERT OR IGNORE INTO memory_revisions VALUES (?,?,?,?,?)').run(survivor.id, survivor.revision, survivor.content, survivor.status, now);
+    if (survivor.source_id) this.db.prepare('INSERT OR IGNORE INTO memory_evidence VALUES (?,?)').run(survivor.id, survivor.source_id);
+    if (source) this.db.prepare('INSERT OR IGNORE INTO memory_evidence VALUES (?,?)').run(survivor.id, source.id);
+    for (const row of absorbed) {
+      this.db.prepare('INSERT OR IGNORE INTO memory_revisions VALUES (?,?,?,?,?)').run(row.id, row.revision, row.content, row.status, now);
+      if (row.source_id) this.db.prepare('INSERT OR IGNORE INTO memory_evidence VALUES (?,?)').run(survivor.id, row.source_id);
+      for (const item of this.db.prepare('SELECT source_id FROM memory_evidence WHERE memory_id=?').all(row.id)) {
+        this.db.prepare('INSERT OR IGNORE INTO memory_evidence VALUES (?,?)').run(survivor.id, item.source_id);
+      }
+    }
+    this.db.prepare("UPDATE memories SET content=?,source_id=?,status='active',revision=revision+1,updated_at=?,fingerprint=? WHERE id=?")
+      .run(content, source?.id || null, now, fingerprint, survivor.id);
+    for (const row of absorbed) {
+      this.db.prepare("UPDATE memories SET content='', status='merged', revision=revision+1, updated_at=?, replaces=?, fingerprint=? WHERE id=?")
+        .run(now, survivor.id, row.fingerprint, row.id);
+      this.db.prepare('INSERT OR REPLACE INTO memory_merges VALUES (?,?,?,?,?)')
+        .run(survivor.id, row.id, row.revision, row.fingerprint, now);
+    }
+    return { id: survivor.id, revision: survivor.revision + 1, status: 'active', merged: absorbed.map(row => row.id), mergedCount: absorbed.length };
+  }
+  // Survivor + every entry absorbed into it, transitively (an already-merged
+  // survivor can itself be absorbed later, so this is not a single hop).
+  family(id) {
+    const root = typeof id === 'string' ? this.db.prepare('SELECT * FROM memories WHERE id=?').get(id) : id;
+    if (!root) return [];
+    const seen = new Set([root.id]);
+    const rows = [root];
+    const queue = [root.id];
+    while (queue.length) {
+      const current = queue.shift();
+      const children = this.db.prepare('SELECT m.* FROM memory_merges g JOIN memories m ON m.id=g.merged_id WHERE g.survivor_id=?').all(current);
+      for (const child of children) {
+        if (seen.has(child.id)) continue;
+        seen.add(child.id); rows.push(child); queue.push(child.id);
+      }
+    }
+    return rows;
+  }
+  forgetFamily(old) {
+    const rows = this.family(old);
+    const now = Date.now();
+    for (const row of rows) {
+      for (const version of this.db.prepare('SELECT content FROM memory_revisions WHERE id=?').all(row.id)) {
+        if (!version.content) continue;
+        this.db.prepare('INSERT OR IGNORE INTO memory_forget_fingerprints VALUES (?)')
+          .run(digest(JSON.stringify([row.kind, row.subject, version.content, row.scope])));
+      }
+      // Bodies cleared by an earlier merge are not in memory_revisions of the
+      // survivor; their fingerprints live on the family edges.
+      for (const edge of this.db.prepare('SELECT merged_fingerprint FROM memory_merges WHERE survivor_id=? OR merged_id=?').all(row.id, row.id)) {
+        this.db.prepare('INSERT OR IGNORE INTO memory_forget_fingerprints VALUES (?)').run(edge.merged_fingerprint);
+      }
+      if (row.content) this.db.prepare('INSERT OR IGNORE INTO memory_forget_fingerprints VALUES (?)')
+        .run(digest(JSON.stringify([row.kind, row.subject, row.content, row.scope])));
+      const sources = this.db.prepare('SELECT source_id FROM memory_evidence WHERE memory_id=?').all(row.id);
+      if (row.source_id) sources.push({ source_id: row.source_id });
+      for (const src of sources) this.db.prepare('INSERT OR IGNORE INTO memory_forget_sources VALUES (?,?,?,?)')
+        .run(src.source_id, row.kind, row.subject, row.scope);
+    }
+    // Clearing every family body/version is what stops an old absorbed entry
+    // from being re-derived by a later review from the same evidence.
+    for (const row of rows) {
+      this.db.prepare("UPDATE memories SET content='', status='forgotten', revision=revision+1, updated_at=? WHERE id=?").run(now, row.id);
+      this.db.prepare('DELETE FROM memory_revisions WHERE id=?').run(row.id);
+    }
+    return { id: old.id, revision: old.revision + 1, status: 'forgotten', family: rows.length - 1 };
+  }
+  list({ key, admin = false, query = '', kind, limit = 20, candidates = false, subjects, ownerQQ = null }) {
     if (!keyOK(key)) throw Error('非法会话');
-    const filter = admin ? '1=1' : "(scope='shared' OR scope=?)";
-    const args = admin ? [] : [key];
+    // 管理员本人私聊：额外可见「subject 是他自己」的跨会话条目，才能找到并管理群里的记忆。
+    const ownerScope = (!admin && ownerQQ != null && String(key) === 'private:' + String(ownerQQ)) ? String(ownerQQ) : null;
+    const filter = admin ? '1=1'
+      : (ownerScope !== null ? "(scope='shared' OR scope=? OR subject=?)" : "(scope='shared' OR scope=?)");
+    const args = admin ? [] : (ownerScope !== null ? [key, ownerScope] : [key]);
     let sql = `SELECT id,kind,subject,content,origin,source_id,evidence,status,revision,updated_at FROM memories WHERE ${filter} AND status IN (${candidates ? "'active','candidate'" : "'active'"})`;
     if (kind) { sql += ' AND kind=?'; args.push(kind); }
     if (subjects?.length) { sql += ` AND subject IN (${subjects.map(() => '?').join(',')})`; args.push(...subjects); }
@@ -258,16 +376,19 @@ export class MemoryStore {
     }
   }
   reserveLearning({ input, output = 500, task = 'slang' }) {
-    const budget = this.config.learning || {};
+    const learning = this.config.learning || {};
+    // 每种任务可有独立预算：否则黑话学习先把每日额度吃满，后台记忆复盘永远 budget-exhausted。
+    const perTask = learning.tasks && typeof learning.tasks === 'object' ? (learning.tasks[task] || {}) : {};
+    const pick = (name, fallback) => Math.max(0, Number(perTask[name] ?? learning[name] ?? fallback) || 0);
     const today = day(), id = randomUUID();
-    const inputMax = Math.max(0, Number(budget.dailyInputTokens ?? 8000));
-    const outputMax = Math.max(0, Number(budget.dailyOutputTokens ?? 1000));
-    const countMax = Math.max(0, Number(budget.dailyRequests ?? 2));
+    const inputMax = pick('dailyInputTokens', 8000);
+    const outputMax = pick('dailyOutputTokens', 1000);
+    const countMax = pick('dailyRequests', 2);
     const estimated = Math.ceil(Number(input));
     if (!Number.isFinite(estimated) || estimated < 0 || estimated > Math.min(3000, inputMax)) throw Error('学习输入超过单次预算');
     const maxOutput = Math.max(1, Math.min(500, outputMax, Math.ceil(output)));
     this.transaction(() => {
-      const used = this.learningUsage();
+      const used = this.learningUsage(task);
       if (used.requests >= countMax || used.input + estimated > inputMax || used.output + maxOutput > outputMax) throw Error('今日自主学习预算已用完');
       this.db.prepare('INSERT INTO learning_requests VALUES (?,?,?,?,NULL,NULL,?)').run(id, today, estimated, maxOutput, task);
     });
@@ -277,12 +398,16 @@ export class MemoryStore {
     this.db.prepare('UPDATE learning_requests SET input_actual=?,output_actual=? WHERE id=?')
       .run(Math.max(0, Number(usage.inputTokens) || 0) + Math.max(0, Number(usage.cacheReadTokens) || 0) + Math.max(0, Number(usage.cacheWriteTokens) || 0), Math.max(0, Number(usage.outputTokens) || 0), id);
   }
-  learningUsage() {
-    const row = this.db.prepare(`SELECT count(*) AS requests,
+  learningUsage(task) {
+    const sql = `SELECT count(*) AS requests,
       coalesce(sum(max(input_reserved,coalesce(input_actual,0))),0) AS input,
       coalesce(sum(max(output_reserved,coalesce(output_actual,0))),0) AS output
-      FROM learning_requests WHERE day=?`).get(day());
-    return { day: day(), ...row };
+      FROM learning_requests WHERE day=?`;
+    // 传 task 时按任务分别结算（每种任务独立额度）；不传则返回当日总量的统计。
+    const row = task
+      ? this.db.prepare(sql + ' AND task=?').get(day(), String(task))
+      : this.db.prepare(sql).get(day());
+    return { day: day(), ...(task ? { task: String(task) } : {}), ...row };
   }
   stats() {
     return { memories: this.db.prepare('SELECT status,count(*) AS count FROM memories GROUP BY status').all(),

@@ -42,6 +42,17 @@ function sampleKeyOf(sessionId, turn, step, retry) {
   return `${sessionId}|${turn}|${step}|${retry}`;
 }
 
+/** DSH uses numeric turn IDs; Pi uses UUIDs. Preserve both across journal replay. */
+function normalizeTurnId(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  const numeric = Number(text);
+  if (Number.isFinite(numeric)) return numeric;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text) ? text : null;
+}
+
 /**
  * 走势图的桶宽阶梯（毫秒）与选择规则。
  *
@@ -189,10 +200,10 @@ export function createTokenLedger({
     }
 
     if (record.k === 'turn') {
-      const turn = Number(record.turn);
+      const turn = normalizeTurnId(record.turn);
       const step = Number(record.step);
       const retry = Number.isFinite(Number(record.retry)) ? Number(record.retry) : 0;
-      if (!Number.isFinite(turn) || !Number.isFinite(step)) return false;
+      if (turn === null || !Number.isFinite(step)) return false;
       const sk = sampleKeyOf(sid, turn, step, retry);
       const prev = samples.get(sk);
       // 幂等关键：只有 seq **严格更新**才允许覆盖。
@@ -377,9 +388,9 @@ export function createTokenLedger({
     const eventProvider = provider ?? event.data?.provider;
 
     if (event.type === 'llm/retry-started') {
-      const turn = Number(event.data?.turn);
+      const turn = normalizeTurnId(event.data?.turn);
       const step = Number(event.data?.step);
-      if (!Number.isFinite(turn) || !Number.isFinite(step)) return false;
+      if (turn === null || !Number.isFinite(step)) return false;
       const retry = Number.isFinite(Number(event.data?.retry)) ? Number(event.data.retry) : 1;
       const axis = retryAxis.get(sessionId);
       if (axis && axis.seq > seq) return false;
@@ -390,9 +401,9 @@ export function createTokenLedger({
     if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') return false;
     const raw = usageOfEvent(event);
     if (!raw) return false;
-    const turn = Number(event.data?.turn);
+    const turn = normalizeTurnId(event.data?.turn);
     const step = Number(event.data?.step);
-    if (!Number.isFinite(turn) || !Number.isFinite(step)) return false;
+    if (turn === null || !Number.isFinite(step)) return false;
     const axis = retryAxis.get(sessionId);
     const retry = axis && axis.turn === turn && axis.step === step ? axis.retry : 0;
     const buckets = normalizeUsage(raw);
@@ -610,7 +621,11 @@ export function createTokenLedger({
       const entry = index.get(sid);
       if (entry) rows.push(...entry.turns.values());
     }
-    rows.sort((a, b) => b.turn - a.turn || b.endedAt - a.endedAt);
+    // Preserve legacy numeric ordering; UUID/mixed histories use event time.
+    const numericTurns = rows.every(row => typeof row.turn === 'number');
+    rows.sort(numericTurns
+      ? (a, b) => b.turn - a.turn || b.endedAt - a.endedAt
+      : (a, b) => b.endedAt - a.endedAt || b.startedAt - a.startedAt || String(b.turn).localeCompare(String(a.turn)));
     return rows;
   }
 

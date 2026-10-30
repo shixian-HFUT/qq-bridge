@@ -31,14 +31,32 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as stateAcl from '../src/state-acl.mjs';
-import { ImageOutbox } from '../src/image-outbox.js';
-import { MemoryStore, LONG_MEMORY_KINDS } from '../src/memory-store.js';
-import { isVoiceRequest, VoiceRequestStore, runVoiceAction } from '../src/voice-request.js';
-import { loadTtsConfig, validateSpeech } from '../src/aliyun-tts.js';
-import * as voiceCadence from '../src/voice-cadence.js';
-import * as roleCard from '../src/role-card.js';
-import { inFlightTurnEvents } from '../src/in-flight-turns.js';
+import { VoiceRequestStore } from '../src/voice-request.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
+
+import * as groupBudget from '../src/group-budget.js';
+import * as memoryOrganizer from '../src/memory-organizer.js';
+import * as memoryOrganizerRuntime from '../src/memory-organizer-runtime.js';
+import * as memoryCaptureHint from '../src/memory-capture-hint.js';
+import * as presetPrompt from '../src/preset-prompt.js';
+import * as roleCard from '../src/role-card.js';
+import * as imageSearchRouting from '../src/image-search-routing.js';
+import * as imageCandidates from '../src/image-candidates.js';
+import * as imageOutbox from '../src/image-outbox.js';
+import * as mediaBatch from '../src/media-batch.js';
+import * as snowlumaConn from '../src/snowluma-conn.js';
+import * as aliyunTts from '../src/aliyun-tts.js';
+import * as speechEmotion from '../src/speech-emotion.js';
+import * as ttsServer from '../src/tts-server.js';
+import * as localImage from '../src/local-image.js';
+import * as voiceRequest from '../src/voice-request.js';
+import * as voiceCadence from '../src/voice-cadence.js';
+import * as groupVoice from '../src/group-voice.js';
+import * as stickerCadence from '../src/sticker-cadence.js';
+import * as privateFallback from '../src/private-fallback.js';
+import * as piToolLoop from '../src/pi-tool-loop.js';
+import * as simpleTools from '../src/simple-tools.js';
+import * as memoryStore from '../src/memory-store.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const CONSOLE_TOKEN = 'fixture-console-token';
@@ -99,7 +117,7 @@ async function busyHarness({ config = {} } = {}) {
   // 在 main() 里提前返回：把看门狗内部结构暴露给断言（不改变 bridge.js 自身）。
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
-    cfg, state, api, longMemory, socialV2, getSocialV2State, ensureSession, sendToQQ,
+    cfg, state, api, socialV2, getSocialV2State, ensureSession, sendToQQ,
     startConsoleServer, retireSession, drainPromptQueue,
     sendWakePromptV2, scheduleWakeV2, deliverPrompt, isConversationBusyV2, wakePriorityV2,
     promptQueues, pendingWakeKeys, pendingWakeLeaseTimers, collectors, v2TurnStartAt,
@@ -128,11 +146,15 @@ async function busyHarness({ config = {} } = {}) {
     setInterval: (fn, ms) => { const handle = { fn, ms, unrefCalled: false, unref() { this.unrefCalled = true; } }; intervals.push(handle); return handle; },
     clearInterval: () => {},
     NodeApiClient: class { constructor() { return api; } },
+    createOwnerToolProvider: () => ({ context: () => ({}) }),
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
-    discoverDshLaunchToken: () => '', unwrap, createTurnCollector, inFlightTurnEvents,
+    discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, VoiceRequestStore, isVoiceRequest, runVoiceAction, loadTtsConfig, validateSpeech, ...voiceCadence, ...roleCard, ImageOutbox, MemoryStore, LONG_MEMORY_KINDS,
-    LocalImages: class {},
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, VoiceRequestStore,
+    ...groupBudget, ...memoryOrganizer, ...memoryOrganizerRuntime, ...memoryCaptureHint, ...presetPrompt, ...roleCard,
+    ...imageSearchRouting, ...imageCandidates, ...imageOutbox, ...mediaBatch, ...snowlumaConn, ...aliyunTts, ...speechEmotion,
+    ...ttsServer, ...localImage, ...voiceRequest, ...voiceCadence, ...groupVoice, ...stickerCadence, ...privateFallback,
+    ...piToolLoop, ...simpleTools, ...memoryStore,
     hardenDir: () => ({ ok: true, detail: 'stub' }),
     processAudioVolume: async (file) => ({ path: String(file), converted: false, applied: false, mode: 'original', volume: 1, loudness: null }),
     cleanupTemp: () => {},
@@ -156,8 +178,10 @@ async function busyHarness({ config = {} } = {}) {
     readLog: () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } },
     async close() {
       for (const t of timeouts) clearTimeout(t);
-      bridge.longMemory?.close();
-      fs.rmSync(temp, { recursive: true, force: true });
+      for (const i of intervals) { try { clearInterval(i); } catch { /* noop */ } }
+      try { bridge.livingMemory?.close?.(); } catch { /* noop */ }
+      try { bridge.longMemory?.close(); } catch { /* noop */ }
+      try { fs.rmSync(temp, { recursive: true, force: true, maxRetries: 8, retryDelay: 120 }); } catch { /* Windows WAL handle lag */ }
     },
   };
 }
@@ -403,7 +427,7 @@ await test('④ 陈旧 collector/v2TurnStartAt：释放 + 墓碑；迟到 turn/e
   assert.match(h.readLog(), /\[watchdog\] 静默排空被释放回合的 turn\/end key=private:123 session=/);
   assert.equal(h.calls.sent.length, 0, '墓碑后的 turn/end 不得发出任何 QQ 消息');
   assert.equal(st.wakeConfig.noActionCount || 0, noActionBefore, '墓碑后的 turn/end 不得改 noActionCount');
-  assert.doesNotMatch(h.readLog(), /补发繁忙期间积压的唤醒/, '墓碑后的 turn/end 不得做 backlog 补发');
+  assert.doesNotMatch(h.readLog(), /补发仍未读的唤醒/, '墓碑后的 turn/end 不得做 backlog 补发');
   assert.doesNotMatch(h.readLog(), /AI 内部输出（不自动转发）/, '墓碑后的 turn/end 不得走 reserved2 的收尾/输出路径');
   assert.equal(h.busyWatchdog.staleBusyTurns.has(sid), false, '墓碑必须在排空时消费掉（不引入新泄漏）');
   assert.equal(h.collectors.has(sid), false);
@@ -666,7 +690,7 @@ await test('F1 回归：② 单独卡忙 + re-arm 后迟到 turn/end（收尾 se
     `F1：同一 (private,seq197) 只能投递一次（计数=1）；log=\n${log}`);
   assert.equal(h.calls.prompts.length, 1, '只允许一次正常投递（计数=1）');
   assert.match(log, /繁忙期间唤醒 private@seq197 已由看门狗重新武装补发，跳过重复补发/);
-  assert.doesNotMatch(log, /补发繁忙期间积压的唤醒：private@seq197/, '不得再排一次 scheduleWakeV2');
+  assert.doesNotMatch(log, /补发仍未读的唤醒：private@seq197/, '不得再排一次 scheduleWakeV2');
   assert.equal(count(log, /\[reserved2\] 计划唤醒 private:123（private）/g), 1,
     '幂等证据：同一 (reason,seq) 在「释放 → re-arm → 迟到 turn/end」全生命周期内只被 scheduleWakeV2 排一次');
   assert.equal([...st.pendingWakeReasons].filter((r) => r.reason === 'private' && r.seq === 197).length, 0,
@@ -708,7 +732,7 @@ await test('F1 反面：只跳过被 re-arm 的那条，其它不同 (reason,seq
   await feedFrames(h, completedTurn(sid, 2, '第二个回合'), 350);
   await sleep(1300);
   const log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：anyMessage@seq198/, '不同 (reason,seq) 的合法补发不得被削弱');
+  assert.match(log, /补发仍未读的唤醒：anyMessage@seq198/, '不同 (reason,seq) 的合法补发不得被削弱');
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（anyMessage）/g), 1, `anyMessage@198 必须真的投递；log=\n${log}`);
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（private）/g), 1, 'private@197 仍然只有一次');
   assert.equal(count(log, /\[reserved2\] 计划唤醒 private:123（private）/g), 1, 'private@197 只被 scheduleWakeV2 排一次');
@@ -744,7 +768,7 @@ await test('F1 不丢消息：re-arm 被再次暂存（③ 仍卡住）→ 不�
   await feedFrames(h, completedTurn(sid, 1, '队列恢复后的回合'), 350);
   await sleep(1300);
   const log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, '未被 re-arm 的条目必须走正常补发（未丢消息）');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, '未被 re-arm 的条目必须走正常补发（未丢消息）');
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（private）/g), 1, '该唤醒最终必须投递出去');
   assert.equal(h.calls.prompts.length, 1);
 });
@@ -790,15 +814,15 @@ await test('F3-a 投递被 DSH 拒绝 → 标记被清除、条目留在 backlog
   h.api.sessions.prompt = async (params) => { h.calls.prompts.push(params); return { result: { ok: true, value: {} } }; };
   h.wakeConfigUpdatedKeys.add(key);
   await feedFrames(h, completedTurn(sid, 1, '恢复后的回合'), 400);
-  await waitFor(() => /补发繁忙期间积压的唤醒：private@seq197/.test(h.readLog()));
+  await waitFor(() => /补发仍未读的唤醒：private@seq197/.test(h.readLog()));
   await waitFor(() => h.calls.prompts.length >= 1);
   await sleep(150);
   log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, 'F3：必须被重排（不得静默丢弃）');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, 'F3：必须被重排（不得静默丢弃）');
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（private）/g), 2, '尝试 2 次（被拒 1 + 重试 1）');
   assert.equal(h.calls.prompts.length, 1, '重试那一次必须真的送达');
   assert.equal([...st.pendingWakeReasons].length, 0, '重排后 backlog 被消费');
-  console.log(`   [证据] 被拒 ${count(log, /唤醒投递被拒/g)} 次；重排补发 ${count(log, /补发繁忙期间积压的唤醒：private@seq197/g)} 次；`
+  console.log(`   [证据] 被拒 ${count(log, /唤醒投递被拒/g)} 次；重排补发 ${count(log, /补发仍未读的唤醒：private@seq197/g)} 次；`
     + `成功送达 ${h.calls.prompts.length} 次；残留登记=${h.busyWatchdog.rearmedWakeV2.has(key)}`);
 });
 
@@ -819,13 +843,13 @@ await test('F3-b 投递抛错 → 标记被清除、条目留在 backlog 并被�
   h.api.sessions.prompt = async (params) => { h.calls.prompts.push(params); return { result: { ok: true, value: {} } }; };
   h.wakeConfigUpdatedKeys.add(key);
   await feedFrames(h, completedTurn(sid, 1, '恢复后的回合'), 400);
-  await waitFor(() => /补发繁忙期间积压的唤醒：private@seq197/.test(h.readLog()));
+  await waitFor(() => /补发仍未读的唤醒：private@seq197/.test(h.readLog()));
   await waitFor(() => h.calls.prompts.length >= 1);
   await sleep(150);
   log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, 'F3：必须被重排（不得静默丢弃）');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, 'F3：必须被重排（不得静默丢弃）');
   assert.equal(h.calls.prompts.length, 1, '重试那一次必须真的送达');
-  console.log(`   [证据] 投递失败 ${count(log, /唤醒投递失败 private:123/g)} 次；重排补发 ${count(log, /补发繁忙期间积压的唤醒：private@seq197/g)} 次；`
+  console.log(`   [证据] 投递失败 ${count(log, /唤醒投递失败 private:123/g)} 次；重排补发 ${count(log, /补发仍未读的唤醒：private@seq197/g)} 次；`
     + `成功送达 ${h.calls.prompts.length} 次；残留登记=${h.busyWatchdog.rearmedWakeV2.has(key)}`);
 });
 
@@ -844,11 +868,11 @@ await test('F3-c 派发时被跳过（skipWake：paused）→ 标记被清除、
   h.socialV2.paused = false;
   h.wakeConfigUpdatedKeys.add(key);
   await feedFrames(h, completedTurn(sid, 1, '恢复后的回合'), 400);
-  await waitFor(() => /补发繁忙期间积压的唤醒：private@seq197/.test(h.readLog()));
+  await waitFor(() => /补发仍未读的唤醒：private@seq197/.test(h.readLog()));
   await waitFor(() => h.calls.prompts.length >= 1);
   await sleep(150);
   const log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, '恢复后必须补发');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, '恢复后必须补发');
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（private）/g), 1, '必须真的送达一次');
   assert.equal(h.calls.prompts.length, 1);
 });
@@ -875,11 +899,11 @@ await test('F3-d 定时器已排上后又被「会话仍忙」再次暂存 → �
   h.v2TurnStartAt.delete(sid);
   h.wakeConfigUpdatedKeys.add(key);
   await feedFrames(h, completedTurn(sid, 1, '窗口恢复后的回合'), 400);
-  await waitFor(() => /补发繁忙期间积压的唤醒：private@seq197/.test(h.readLog()));
+  await waitFor(() => /补发仍未读的唤醒：private@seq197/.test(h.readLog()));
   await waitFor(() => h.calls.prompts.length >= 1);
   await sleep(150);
   log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, '窗口恢复后必须补发');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, '窗口恢复后必须补发');
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（private）/g), 1, '最终必须送达一次');
   assert.equal(h.calls.prompts.length, 1);
 });
@@ -960,7 +984,7 @@ await test('F3 对照：过度清理（把已成功送达的标记也清掉）�
   await waitFor(() => count(h.readLog(), /\[reserved2\] 唤醒 private:123（private）/g) >= 2);
   await sleep(150);
   const log = h.readLog();
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, '对照：清掉标记后 shift 会走「正常补发」分支');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, '对照：清掉标记后 shift 会走「正常补发」分支');
   assert.equal(count(log, /\[reserved2\] 唤醒 private:123（private）/g), 2, '对照：同一 (private,197) 被投递 2 次 = F1 复发');
   assert.equal(h.calls.prompts.length, 2);
   console.log(`   [证据] 对照（过度清理）：同一 (private,197) 投递 ${count(log, /\[reserved2\] 唤醒 private:123（private）/g)} 次、`
@@ -990,15 +1014,15 @@ await test('F4-a 离线队列溢出（QUEUE_MAX）丢弃带 wake 的待投项 �
   h.setReady(true);
   h.wakeConfigUpdatedKeys.add(key);
   await feedFrames(h, completedTurn(sid, 1, '溢出之后的回合'), 400);
-  await waitFor(() => /补发繁忙期间积压的唤醒：private@seq197/.test(h.readLog()));
+  await waitFor(() => /补发仍未读的唤醒：private@seq197/.test(h.readLog()));
   await waitFor(() => h.calls.prompts.length >= 1);
   await sleep(150);
   const log = h.readLog();
   assert.equal(count(log, /跳过重复补发/g), 0, 'F4：被溢出丢弃的待投唤醒不得让 shift 走跳过分支');
-  assert.match(log, /补发繁忙期间积压的唤醒：private@seq197/, '该条必须重新排入正常投递路径');
+  assert.match(log, /补发仍未读的唤醒：private@seq197/, '该条必须重新排入正常投递路径');
   assert.equal(h.calls.prompts.length, 1, '最终必须真的送达（计数=1）');
   console.log(`   [证据] 溢出丢弃后 残留登记=${h.busyWatchdog.rearmedWakeV2.has(key)}；跳过重复补发=${count(log, /跳过重复补发/g)} 次；`
-    + `重排补发=${count(log, /补发繁忙期间积压的唤醒：private@seq197/g)} 次；送达=${h.calls.prompts.length} 次`);
+    + `重排补发=${count(log, /补发仍未读的唤醒：private@seq197/g)} 次；送达=${h.calls.prompts.length} 次`);
 });
 
 await test('F4-b enqueueForRetry 溢出丢最旧（同族点 :2830）→ 带 wake 的项被丢时清标记', withWatchdog(SCALED), async (h) => {

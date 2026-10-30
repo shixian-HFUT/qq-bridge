@@ -69,3 +69,26 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+
+# Amiya deployment and LivingMemory runtime material
+secrets/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.test-tmp/
+**/.env
+**/.env.*
+!**/.env.example
+**/*.sqlite*
+**/*.db
+**/*.faiss
+**/*.index
+**/*.pem
+**/*.key
+**/*.token
+**/*.zip
+**/*.tar.gz
+**/*.tgz
+**/*.pyc
+services/livingmemory/data/
+services/livingmemory/config/service.json

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { safeFetchAudioBuffer } from './safe-fetch.js';
+import { normalizeSpeechEmotion, speechEmotionInstruction } from './speech-emotion.js';
 
 export function loadTtsConfig(root) {
   const file = path.join(root, 'state', 'tts-settings.json');
@@ -99,12 +100,15 @@ export async function aliyunRequest(config, operation, body, { fetchImpl = fetch
   }
 }
 
-export async function synthesizeSpeech(root, text, { config = loadTtsConfig(root), fetchImpl, download = safeFetchAudioBuffer } = {}) {
+export async function synthesizeSpeech(root, text, { config = loadTtsConfig(root), emotion, fetchImpl, download = safeFetchAudioBuffer } = {}) {
   text = validateSpeech(text, config);
+  emotion = normalizeSpeechEmotion(emotion);
+  const instruction = speechEmotionInstruction(emotion, config.model);
   if (!config.voiceId || !String(config.voiceId).startsWith(`${config.model}-`)) throw new Error('请先创建与合成模型匹配的音色');
   const cacheDir = path.join(root, 'state', 'tts-cache');
   fs.mkdirSync(cacheDir, { recursive: true });
   const payload = { model: config.model, input: { text, voice: config.voiceId, format: 'wav', sample_rate: 24000, rate: 1, language_hints: ['zh'], word_timestamp_enabled: true } };
+  if (instruction) payload.input.instruction = instruction;
   const cacheId = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
   const cacheFile = path.join(cacheDir, `${cacheId}.json`);
   let result;
@@ -136,5 +140,5 @@ export async function synthesizeSpeech(root, text, { config = loadTtsConfig(root
     const old = path.join(dir, name);
     try { if (Date.now() - fs.statSync(old).mtimeMs > 24 * 3600000) fs.unlinkSync(old); } catch {}
   }
-  return { file, detail, model: config.model };
+  return { file, detail, model: config.model, emotion };
 }

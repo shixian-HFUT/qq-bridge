@@ -28,13 +28,6 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as stateAcl from '../src/state-acl.mjs';
-import { ImageOutbox } from '../src/image-outbox.js';
-import { MemoryStore, LONG_MEMORY_KINDS } from '../src/memory-store.js';
-import { isVoiceRequest, VoiceRequestStore, runVoiceAction } from '../src/voice-request.js';
-import { loadTtsConfig, validateSpeech } from '../src/aliyun-tts.js';
-import * as voiceCadence from '../src/voice-cadence.js';
-import * as roleCard from '../src/role-card.js';
-import { inFlightTurnEvents } from '../src/in-flight-turns.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -95,7 +88,7 @@ function verifyHarness({ config = {}, transformSource } = {}) {
   // 在 main() 里提前返回内部结构供断言（脚本侧源码变换，不改 src/bridge.js 本体）。
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
-    cfg, state, api, longMemory, socialV2, social, getSocialV2State, ensureSession,
+    cfg, state, api, socialV2, social, getSocialV2State, ensureSession,
     sendWakePromptV2, scheduleWakeV2, deliverPrompt, isConversationBusyV2, wakePriorityV2,
     promptQueues, pendingWakeKeys, pendingWakeLeaseTimers, collectors, v2TurnStartAt,
     armPendingWakeLease, disarmPendingWakeLease, reverse, wakeConfigUpdatedKeys, markReadCalledKeys,
@@ -131,9 +124,9 @@ function verifyHarness({ config = {}, transformSource } = {}) {
     clearInterval: (handle) => clearInterval(handle),
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
-    discoverDshLaunchToken: () => '', unwrap, createTurnCollector, inFlightTurnEvents,
+    discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, VoiceRequestStore, isVoiceRequest, runVoiceAction, loadTtsConfig, validateSpeech, ...voiceCadence, ...roleCard, ImageOutbox, MemoryStore, LONG_MEMORY_KINDS, LocalImages: class {},
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl,
     hardenDir: () => ({ ok: true, detail: 'stub' }),
     processAudioVolume: async (file) => ({ path: String(file), converted: false, applied: false, mode: 'original', volume: 1, loudness: null }),
     cleanupTemp: () => {},
@@ -158,7 +151,6 @@ function verifyHarness({ config = {}, transformSource } = {}) {
     bridge.close = () => {
       for (const handle of timeouts) clearTimeout(handle);
       for (const record of intervals) clearInterval(record.handle);
-      bridge.longMemory?.close();
       fs.rmSync(temp, { recursive: true, force: true });
     };
     // 真事件流喂帧器：帧经真实 pumpMux → noteFrameActivityV2 链路生效。

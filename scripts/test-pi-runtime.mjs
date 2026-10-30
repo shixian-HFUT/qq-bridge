@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { once } from 'node:events';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PiApiClient } from '../src/pi-client.js';
 import { MemoryStore } from '../src/memory-store.js';
 import { repairToolPairs, projectPiContext, terminalToolResult, piContent } from '../src/pi-context.js';
@@ -19,6 +19,8 @@ const result = value => ({ content: [{ type: 'text', text: JSON.stringify(value)
 const toolName = 'mcp__snowluma__qq_send_message';
 const calls = [];
 let failSend = false;
+let quotaSend = false;
+let markReadMode = false;
 let sends = 0;
 let paused;
 const server = http.createServer(async (req, res) => {
@@ -32,7 +34,8 @@ const server = http.createServer(async (req, res) => {
   const learning = body.model === 'learning-fixture';
   assert.equal(body.max_tokens, learning ? 500 : 256);
   const isFollowUp = body.messages.at(-1)?.role === 'tool';
-  const delta = learning ? { role: 'assistant', content: '[]' } : isFollowUp ? { role: 'assistant', content: 'done' } : { role: 'assistant', tool_calls: [{ index: 0, id: 'call_' + calls.length, type: 'function', function: { name: toolName, arguments: '{}' } }] };
+  const batch = Array.from({ length: quotaSend ? 2 : 1 }, (_, index) => ({ index, id: 'call_' + calls.length + '_' + index, type: 'function', function: { name: markReadMode ? 'mcp__snowluma__qq_mark_read' : toolName, arguments: '{}' } }));
+  const delta = learning ? { role: 'assistant', content: '[]' } : isFollowUp ? { role: 'assistant', content: 'done' } : { role: 'assistant', tool_calls: batch };
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   const emit = (delta, finish_reason, usage) => res.write('data: ' + JSON.stringify({ id: 'test', object: 'chat.completion.chunk', model: body.model, choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) }) + '\n\n');
   emit(delta, null);
@@ -45,6 +48,7 @@ process.env.QQ_PI_FIXTURE_KEY = 'fixture-other-project-key';
 fs.writeFileSync(config.credentialFile, 'QQ_PI_FIXTURE_KEY=fixture-only-no-real-key\n');
 const tool = { name: toolName, label: 'send', description: 'fixture tool', parameters: { type: 'object', properties: {}, additionalProperties: false }, execute: async () => {
   sends++; if (paused) await paused;
+  if (quotaSend) return { ...result({ ok: false, code: 'SEND_RATE_LIMIT', unknown: false, remaining: 0, retryAt: Date.now() + 60000 }), isError: true };
   return { ...result({ ok: !failSend, failed: failSend ? 1 : 0, turnComplete: !failSend }), details: { bridgeTerminal: !failSend }, isError: failSend };
 } };
 function client(root = temp, overrides = {}) {
@@ -67,8 +71,15 @@ try {
   finally { await bridge.close(); }
   fs.mkdirSync(path.join(temp, 'runtime', 'pi'), { recursive: true });
   fs.writeFileSync(path.join(temp, 'runtime', 'pi', 'package.json'), '{"type":"module"}');
-  fs.copyFileSync(path.join(project, 'runtime', 'pi', 'sdk.js'), path.join(temp, 'runtime', 'pi', 'sdk.js'));
-  fs.symlinkSync(path.join(project, 'runtime', 'pi', 'node_modules'), path.join(temp, 'runtime', 'pi', 'node_modules'), 'junction');
+  // 本沙箱禁止在临时目录创建 junction；改为让临时 sdk.js 用绝对 file URL 引用
+  // 同一份锁定依赖。断言与运行时行为不变，只是不再复制/链接 node_modules。
+  const piRoot = path.join(project, 'runtime', 'pi', 'node_modules', '@earendil-works');
+  fs.writeFileSync(path.join(temp, 'runtime', 'pi', 'sdk.js'), [
+    `export { Agent } from ${JSON.stringify(pathToFileURL(path.join(piRoot, 'pi-agent-core', 'dist', 'index.js')).href)};`,
+    `export { createModels } from ${JSON.stringify(pathToFileURL(path.join(piRoot, 'pi-ai', 'dist', 'models.js')).href)};`,
+    `export { openAICompletionsApi } from ${JSON.stringify(pathToFileURL(path.join(piRoot, 'pi-ai', 'dist', 'api', 'openai-completions.lazy.js')).href)};`,
+    ''
+  ].join('\n'));
   const presetDir = path.join(temp, 'dsh', 'agent-presets', 'qq-chat-v2'); fs.mkdirSync(presetDir, { recursive: true });
   fs.writeFileSync(path.join(presetDir, 'agent.cordis.yml'), '- id: persona\n  config:\n    prefix: fixture safe preset\n');
   check('terminal finish requires successful send and no unread messages', () => {
@@ -109,6 +120,29 @@ try {
   await prompt(c, id);
   check('failed send is not treated as a completed reply', () => assert.equal(calls.length - beforeFailure, 2));
   failSend = false;
+  quotaSend = true;
+  const quotaId = await create(c), beforeQuota = calls.length, beforeQuotaSends = sends;
+  await prompt(c, quotaId);
+  check('a known quota rejection ends without another model call and blocks the remaining batch', () => {
+    assert.equal(calls.length - beforeQuota, 1); assert.equal(sends - beforeQuotaSends, 1);
+    assert.ok(c.loadSession(quotaId).records.some(r => r.type === 'turn/quota-stop'));
+    assert.equal(c.loadSession(quotaId).messages.filter(m => m.role === 'toolResult').length, 2);
+  });
+  quotaSend = false;
+  markReadMode = true;
+  const markName = 'mcp__snowluma__qq_mark_read';
+  const busyMark = client(temp, { tools: [{ ...tool, name: markName, execute: async () => {
+    const response = result({ ok: true, markedCount: 1, unreadCount: 30, readThroughSeq: 1, turnComplete: true });
+    return { ...response, details: { bridgeTerminal: terminalToolResult(markName, response, { throughSeq: 1 }) } };
+  } }] });
+  const busyMarkId = await create(busyMark), beforeMark = calls.length;
+  await prompt(busyMark, busyMarkId);
+  check('busy-group mark-read ends after one request even when newer messages remain unread', () => {
+    assert.equal(calls.length - beforeMark, 1);
+    const receipt = busyMark.loadSession(busyMarkId).messages.find(m => m.role === 'toolResult');
+    assert.equal(JSON.parse(receipt.content.find(c => c.type === 'text').text).unreadCount, 30);
+  });
+  markReadMode = false;
   const other = await create(c); await prompt(c, other);
   check('conversation histories are isolated', () => assert.equal(c.loadSession(other).messages.filter(m => m.role === 'user').length, 1));
   const recovered = client();

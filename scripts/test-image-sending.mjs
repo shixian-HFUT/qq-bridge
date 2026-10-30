@@ -12,12 +12,13 @@ import { searchImages } from '../src/image-search-routing.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=', 'base64');
 async function fixture(t) {
-  let prepare = async url => { if (!url.startsWith('https://public.test/')) throw Error('private URL rejected'); return { buffer: png }; };
+  const searchPng = Buffer.from(png); searchPng.writeUInt32BE(1024, 16); searchPng.writeUInt32BE(1024, 20);
+  let prepare = async url => { if (!url.startsWith('https://public.test/')) throw Error('private URL rejected'); return { buffer: /\/\d+\.png$/.test(url) ? searchPng : png }; };
   const h = await bridgeHarness({ config: { snowluma: { httpUrl: 'http://127.0.0.1:3000' }, socialV2: {
     tools: { sendImage: true }, sticker: { enabled: false }, proactive: { enabled: false }, wake: { observationMode: 'background' }, send: {} } },
     globals: { safeFetchBuffer: (...args) => prepare(...args),
       searchImages: (args, options) => searchImages(args, { ...options, danbooru: async () => ({
-        ok: true, results: [1, 2, 3].map(n => ({ url: `https://public.test/${n}.png` })),
+        ok: true, results: [1, 2, 3].map(n => ({ url: `https://public.test/${n}.png`, title: '阿米娅' })),
       }) }) } });
   h.setMode('reserved2');
   const key = 'group:456', st = h.getSocialV2State(key);
@@ -69,7 +70,7 @@ test('an image finishing after another message cannot acknowledge the new messag
   const before = await f.request(undefined, 'unread');
   f.setPrepare(async () => { f.add('103'); return { buffer: png }; });
   const r = await f.request({ url: 'https://public.test/image.png', throughSeq: before.data.readThroughSeq });
-  assert.equal(r.data.ok, true); assert.equal(r.data.turnComplete, false); assert.equal(r.data.unreadCount, 1);
+  assert.equal(r.data.ok, true); assert.equal(r.data.turnComplete, true); assert.equal(r.data.unreadCount, 1);
   assert.equal(f.st.unread[0].messageId, '103');
 });
 
@@ -130,7 +131,33 @@ test('real search/send routes exclude old URLs and reject the same bytes at a ne
   assert.equal(alias.data.duplicate, true); assert.equal(alias.data.unknown, false);
   assert.equal(f.sends().length, 1);
   f.setPrepare(async () => ({ buffer: Buffer.concat([png, Buffer.from('different-image')]) }));
-  const different = await f.request({ requestId: '103', url: 'https://public.test/3.png' });
+  const different = await f.request({ requestId: '103', url: 'https://public.test/fresh.png' });
   assert.equal(different.data.ok, true, JSON.stringify(different.data));
   assert.equal(f.sends().length, 2);
+});
+
+test('search checks actual dimensions and send reuses those exact bytes without downloading again', async t => {
+  const f = await fixture(t); let downloads = 0;
+  const image = Buffer.from(png); image.writeUInt32BE(1200, 16); image.writeUInt32BE(1800, 20);
+  f.setPrepare(async () => { downloads++; return { buffer: image }; });
+  const found = await f.request({ query: '阿米娅', count: 1 }, 'search-images');
+  assert.equal(found.data.ok, true); assert.equal(found.data.results[0].width, 1200);
+  assert.equal(found.data.results[0].downloadVerified, true); assert.equal(found.data.results[0].contentVerified, false);
+  assert.equal(downloads, 1);
+  f.setPrepare(async () => { throw Error('origin now unavailable'); });
+  const sent = await f.request({ url: found.data.results[0].url });
+  assert.equal(sent.data.ok, true); assert.equal(f.sends().length, 1);
+  assert.equal(f.sends()[0].body.message[0].data.file, 'base64://' + image.toString('base64'));
+});
+
+test('search rejects thumbnails and rechecks pause/authorization before returning candidates', async t => {
+  const f = await fixture(t);
+  f.setPrepare(async () => ({ buffer: png }));
+  const small = await f.request({ query: '阿米娅', count: 1, rating: 'nsfw' }, 'search-images');
+  assert.equal(small.data.ok, false); assert.equal(f.sends().length, 0);
+  const image = Buffer.from(png); image.writeUInt32BE(1200, 16); image.writeUInt32BE(1800, 20);
+  f.setPrepare(async () => { f.h.socialV2.paused = true; return { buffer: image }; });
+  const paused = await f.request({ query: '阿米娅', count: 1 }, 'search-images');
+  assert.equal(paused.data.ok, false); assert.match(paused.data.error, /状态已变化/);
+  assert.equal(f.sends().length, 0);
 });

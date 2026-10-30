@@ -7,6 +7,7 @@
 import { matchCharacterAlias, searchDanbooru } from './danbooru-search.js';
 import { searchBingImages } from './bing-images.js';
 import { imageUrlFingerprint } from './image-identity.js';
+import { supportedImageUrl } from './image-candidates.js';
 
 export const IMAGE_SOURCES = ['auto', 'anime', 'photo'];
 
@@ -27,7 +28,7 @@ export function chooseImageSource({ source = 'auto', query = '', rating } = {}) 
   const q = String(query ?? '');
   const src = IMAGE_SOURCES.includes(String(source).toLowerCase()) ? String(source).toLowerCase() : 'auto';
   const characterTag = matchCharacterAlias(q);
-  const cosplay = Boolean(characterTag) && wantsCosplay(q);
+  const cosplay = wantsCosplay(q);
 
   // 成人请求只走 Danbooru：只有它带 rating 分级，必应没有过滤能力。
   if (rating === 'nsfw' || NSFW_HINT.test(q)) return { engine: 'danbooru', cosplay, reason: 'nsfw-requires-rating' };
@@ -52,31 +53,52 @@ export function chooseImageSource({ source = 'auto', query = '', rating } = {}) 
 // duplicate filtering within the MCP timeout. Never return old images as filler.
 export async function searchImages({ source, query, rating, count } = {}, {
   danbooru = searchDanbooru, bing = searchBingImages, isExcluded = () => false,
+  validateCandidate, timeoutMs = 45000,
 } = {}) {
   const route = chooseImageSource({ source, query, rating });
   const size = Math.min(8, Math.max(1, Math.floor(Number(count) || 6)));
   const poolSize = Math.min(32, Math.max(24, size * 4));
+  const signal = AbortSignal.timeout(timeoutMs);
+  let checkedCount = 0;
   const collect = async (provider, extra = {}) => {
     const results = [], seen = new Set();
-    let last, excludedCount = 0;
+    let last, excludedCount = 0, rejectedCount = 0, providerChecks = 0;
     for (let page = 1; page <= 2; page++) {
-      last = await provider({ query, limit: poolSize, page, timeoutMs: 8000, ...extra });
+      if (signal.aborted) break;
+      last = await provider({ query, limit: poolSize, page, timeoutMs: 8000, signal, ...extra });
+      rejectedCount += Number(last.rejectedCount) || 0;
       if (!last.ok || !last.results?.length) break;
       let added = 0;
+      const candidates = [];
       for (const candidate of last.results) {
         let identity;
         try { identity = imageUrlFingerprint(candidate.url); } catch { continue; }
         if (seen.has(identity)) continue;
         seen.add(identity); added++;
         if (isExcluded(candidate.url)) { excludedCount++; continue; }
-        results.push(candidate);
-        if (results.length >= size) break;
+        if (!supportedImageUrl(candidate.url)) { rejectedCount++; continue; }
+        candidates.push(candidate);
+      }
+      for (let offset = 0; offset < candidates.length && results.length < size && !signal.aborted;) {
+        if (validateCandidate && (checkedCount >= 32 || providerChecks >= 16)) break;
+        const batch = candidates.slice(offset, offset + Math.min(3, size - results.length, validateCandidate ? Math.min(32 - checkedCount, 16 - providerChecks) : 3));
+        offset += batch.length;
+        if (validateCandidate) { checkedCount += batch.length; providerChecks += batch.length; }
+        const accepted = await Promise.all(batch.map(async candidate => {
+          if (!validateCandidate) return candidate;
+          try { return await validateCandidate(candidate, { query, signal }); }
+          catch { return null; }
+        }));
+        for (const candidate of accepted) {
+          if (candidate) results.push(candidate); else rejectedCount++;
+        }
       }
       if (results.length >= size || added === 0 || last.results.length < poolSize) break;
     }
-    return { ...last, ok: results.length > 0, count: results.length, results, excludedCount,
+    return { ...last, ok: results.length > 0, count: results.length, results, excludedCount, rejectedCount,
       ...(results.length ? { error: undefined } : excludedCount ? { exhausted: true,
-        error: '当前候选已在本会话发送过或发送结果不明，暂未找到新图片；不要重发旧图或连续重试。' } : {}) };
+        error: '当前候选已在本会话发送过或发送结果不明，暂未找到新图片；不要重发旧图或连续重试。' }
+        : rejectedCount || signal.aborted ? { error: '本次未找到主题相符、清晰且能下载的图片；不要用低清图、视频或其他角色凑数。' } : {}) };
   };
   if (route.engine === 'bing') {
     return { source: 'bing', ...await collect(bing) };
@@ -91,5 +113,7 @@ export async function searchImages({ source, query, rating, count } = {}, {
       note: route.cosplay ? 'Danbooru 未找到可用的真人 cos 照片，已改用必应检索；候选尚未做图像内容核验。'
         : 'Danbooru 未返回可用图片，已改用必应检索。' };
   }
-  return { source: resultSource, ...result };
+  return { source: resultSource, ...result, rejectedCount: result.rejectedCount + fallback.rejectedCount,
+    attempts: [{ source: resultSource, count: result.count, error: result.error },
+      { source: 'bing(fallback)', count: fallback.count, error: fallback.error }] };
 }

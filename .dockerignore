@@ -1,0 +1,11 @@
+.git
+node_modules
+**/node_modules
+state
+secrets
+config.json
+**/.env
+**/*.log
+**/*.bak*
+services
+docs

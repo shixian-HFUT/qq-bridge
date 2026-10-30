@@ -1,0 +1,6 @@
+{
+  "name": "qq-dsh-manager",
+  "version": "0.1.0",
+  "type": "module",
+  "dsh": { "bundle": { "patch": ["./preset.patch.yml"] } }
+}

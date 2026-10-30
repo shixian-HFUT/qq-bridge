@@ -41,8 +41,18 @@ await test('send and acknowledge preserve messages arriving during the send', as
   const r = await request('send-message', { messages: ['reply'], throughSeq: read.data.readThroughSeq });
   assert.equal(r.status, 200);
   assert.equal(r.data.markedCount, 1);
-  assert.equal(r.data.turnComplete, false);
+  assert.equal(r.data.turnComplete, true);
+  assert.equal(r.data.nextAction, 'end-turn');
   assert.deepEqual(Array.from(st.unread, m => m.text), ['arrived during send']);
+});
+
+await test('mark-read closes the displayed batch while leaving later arrivals unread', async ({ st, request, append }) => {
+  append('displayed batch');
+  const read = await request('unread');
+  append('later arrival');
+  const r = await request('mark-read', { throughSeq: read.data.readThroughSeq });
+  assert.equal(r.data.turnComplete, true); assert.equal(r.data.nextAction, 'end-turn');
+  assert.deepEqual(Array.from(st.unread, m => m.text), ['later arrival']);
 });
 
 await test('all-success send closes without a mark-read or idle-check tool call', async ({ h, st, request, append }) => {
@@ -123,11 +133,15 @@ await test('foreground observation requirement remains in force', async ({ reque
   assert.ok(r.data.preSleepWaitRemainingMs > 0);
 }, { background: false });
 
-await test('a real follow-up continues a reply window without consuming a new wake quota', async ({ h, st, append }) => {
+await test('a group follow-up waits for the shared wake quota instead of bypassing it', async ({ h, st, append }) => {
   h.cfg.socialV2.wake.maxWakePerMinute = 1;
   st.lastAiReplyAt = Date.now();
   st.wakeTimes = [Date.now()];
   append('actual follow-up');
+  await h.sendWakePromptV2(KEY, 'continuation');
+  assert.equal(h.calls.prompts.length, 0);
+  assert.equal(st.wakeTimes.length, 1);
+  st.wakeTimes = [];
   await h.sendWakePromptV2(KEY, 'continuation');
   assert.equal(h.calls.prompts.length, 1);
   assert.equal(st.wakeTimes.length, 1);
@@ -142,4 +156,4 @@ await test('an expired observation window cannot bypass wake limits', async ({ h
   assert.equal(h.calls.prompts.length, 0);
 });
 
-console.log(`Reply-flow regressions: ${passed}/11 passed (isolated peers, no paid calls).`);
+console.log(`Reply-flow regressions: ${passed}/12 passed (isolated peers, no paid calls).`);

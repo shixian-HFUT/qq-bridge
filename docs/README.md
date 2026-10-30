@@ -1,3 +1,5 @@
+> **当前阿米娅维护分支入口：** [架构](AMIYA_CURRENT.md)、[部署](AMIYA_DEPLOYMENT.md)、[测试](AMIYA_TESTING.md)、[来源](AMIYA_UPSTREAM.md)。下表包含传统 DSH/本机版本的历史资料。
+
 # 文档索引（docs/README.md）
 
 > 根目录只留 `README.md` / `README.en.md` / `RULES.md` 三个文档，其余全部在本目录下。

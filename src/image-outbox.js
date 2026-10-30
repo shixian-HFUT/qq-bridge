@@ -31,17 +31,18 @@ export class ImageOutbox {
     if (this.unavailable) throw Error('图片发送记录不可读，暂不能排除已发送图片');
     const scope = imageHash(key), urlFingerprint = imageUrlFingerprint(url);
     return this.protectedRows().some(([, row]) => row.scope === scope
-      && (row.urlFingerprint === urlFingerprint || row.urlAliases?.includes(urlFingerprint)));
+      && (row.urlFingerprint === urlFingerprint || row.urlFingerprints?.includes(urlFingerprint) || row.urlAliases?.includes(urlFingerprint)));
   }
   assertFresh(scope, fields, exceptId) {
     const duplicate = this.protectedRows().find(([id, row]) => id !== exceptId && row.scope === scope
       && Object.entries(fields).some(([name, value]) => value
-        && (row[name] === value || (name === 'urlFingerprint' && row.urlAliases?.includes(value)))));
+        && (row[name] === value || (name === 'urlFingerprint' && (row.urlFingerprints?.includes(value) || row.urlAliases?.includes(value)))
+          || (name === 'contentFingerprint' && row.contentFingerprints?.includes(value)))));
     if (!duplicate) return;
     const row = duplicate[1];
     // A byte-identical alias is also excluded from future search results.
-    if (fields.contentFingerprint && row.contentFingerprint === fields.contentFingerprint && fields.urlFingerprint
-      && row.urlFingerprint !== fields.urlFingerprint && !row.urlAliases?.includes(fields.urlFingerprint)) {
+    if (fields.contentFingerprint && (row.contentFingerprint === fields.contentFingerprint || row.contentFingerprints?.includes(fields.contentFingerprint)) && fields.urlFingerprint
+      && row.urlFingerprint !== fields.urlFingerprint && !row.urlFingerprints?.includes(fields.urlFingerprint) && !row.urlAliases?.includes(fields.urlFingerprint)) {
       row.urlAliases = [...(row.urlAliases || []), fields.urlFingerprint].slice(-256);
       this.save();
     }
@@ -61,40 +62,72 @@ export class ImageOutbox {
     if (previous?.status === 'sent') return { messageId: previous.messageId, alreadySent: true };
     if (previous?.status === 'unknown' || previous?.status === 'sending') {
       const error = Error('这张图片发送结果不明，不可重发；请先在QQ确认');
-      error.unknown = true; throw error;
+      error.unknown = true; error.alreadyAttempted = true; throw error;
     }
-    if (this.pending.has(id)) return { ...(await this.pending.get(id)), alreadySent: true };
+    if (this.pending.has(id)) {
+      try { return { ...(await this.pending.get(id)), alreadySent: true }; }
+      catch (error) { throw Object.assign(Error(error.message), error, { alreadyAttempted: true }); }
+    }
     if (!previous && Object.keys(this.rows).length >= 10000) throw Error('图片发送记录已满，请管理员整理');
     const scope = imageHash(key);
-    const urlFingerprint = source.url ? imageUrlFingerprint(source.url) : undefined;
-    if (urlFingerprint) this.assertFresh(scope, { urlFingerprint }, id);
+    const urlFingerprints = source.url ? [imageUrlFingerprint(source.url)]
+      : Array.isArray(source.urls) ? source.urls.map(imageUrlFingerprint) : [];
+    if (new Set(urlFingerprints).size !== urlFingerprints.length) throw Error('同一组图片包含重复网址');
+    for (const urlFingerprint of urlFingerprints) this.assertFresh(scope, { urlFingerprint }, id);
     // Reserve synchronously before any await, including a download.
-    const row = this.rows[id] = { fingerprint, scope, ...(urlFingerprint ? { urlFingerprint } : {}), status: 'prepared', at: Date.now() };
+    const row = this.rows[id] = { fingerprint, scope,
+      ...(urlFingerprints.length === 1 ? { urlFingerprint: urlFingerprints[0] } : urlFingerprints.length ? { urlFingerprints, urlAliases: [...urlFingerprints] } : {}),
+      status: 'prepared', at: Date.now() };
     const work = (async () => {
       let dispatched = false;
+      const shadows = [];
       try {
         const image = await prepare();
-        if (urlFingerprint) {
-          const buffer = Buffer.isBuffer(image) ? image : image.buffer;
-          if (!Buffer.isBuffer(buffer)) throw Error('图片内容不可用');
-          const contentFingerprint = imageHash(buffer);
-          this.assertFresh(scope, { urlFingerprint, contentFingerprint }, id);
-          row.contentFingerprint = contentFingerprint;
+        if (urlFingerprints.length) {
+          const images = Array.isArray(image?.images) ? image.images : [image];
+          if (images.length !== urlFingerprints.length) throw Error('图片来源和下载数量不一致');
+          const fingerprints = images.map(item => {
+            const buffer = Buffer.isBuffer(item) ? item : item.buffer;
+            if (!Buffer.isBuffer(buffer)) throw Error('图片内容不可用');
+            return imageHash(buffer);
+          });
+          if (new Set(fingerprints).size !== fingerprints.length) throw Error('同一组图片内容重复');
+          for (let i = 0; i < fingerprints.length; i++) this.assertFresh(scope, { urlFingerprint: urlFingerprints[i], contentFingerprint: fingerprints[i] }, id);
+          row.contentFingerprint = fingerprints[0];
+          if (fingerprints.length > 1) {
+            row.contentFingerprints = fingerprints;
+            // Scalar shadow rows let an older reader retain URL/byte dedup even
+            // after a source rollback. All refer to the same QQ message.
+            if (Object.keys(this.rows).length + fingerprints.length > 10000) throw Error('图片发送记录已满，请管理员整理');
+            const ids = fingerprints.map((_, i) => hash(JSON.stringify([key, requestId, 'media-item', i])));
+            if (ids.some(itemId => this.rows[itemId])) throw Error('批量图片发送记录冲突，已暂停发送');
+            for (let i = 0; i < ids.length; i++) {
+              const item = this.rows[ids[i]] = { fingerprint: hash(fingerprint + ':' + i), scope,
+                urlFingerprint: urlFingerprints[i], contentFingerprint: fingerprints[i], status: 'prepared', at: row.at };
+              shadows.push([ids[i], item]);
+            }
+          }
         }
         const messageId = await dispatch(image, () => {
-          row.status = 'sending'; this.save(); dispatched = true;
+          row.status = 'sending'; for (const [, item] of shadows) item.status = 'sending';
+          this.save(); dispatched = true;
         });
         if (!/^-?[1-9]\d*$/.test(String(messageId ?? ''))) throw Error('QQ未返回有效图片消息ID');
-        row.status = 'sent'; row.messageId = String(messageId); this.save();
+        row.status = 'sent'; row.messageId = String(messageId);
+        for (const [, item] of shadows) { item.status = 'sent'; item.messageId = row.messageId; }
+        this.save();
         return { messageId: row.messageId, alreadySent: false };
       } catch (error) {
         if (dispatched) {
-          row.status = 'unknown'; try { this.save(); } catch {}
+          row.status = 'unknown'; for (const [, item] of shadows) item.status = 'unknown';
+          try { this.save(); } catch {}
           const failure = Error('图片发送结果不明，不可重发；请先在QQ确认');
           failure.unknown = true; throw failure;
         }
         delete this.rows[id];
+        for (const [itemId] of shadows) delete this.rows[itemId];
         try { this.save(); } catch { this.unavailable = true; }
+        if (error.unknown !== true) error.unknown = false;
         throw error;
       }
     })();

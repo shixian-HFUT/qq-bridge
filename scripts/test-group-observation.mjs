@@ -37,11 +37,12 @@ test('admin can persist a group observation override without changing probabilit
   const detail=await capability.json();assert.equal(capability.status,200);assert.equal(detail.workflow.observationMs,180000);
 });
 
-test('an expired three minute continuation cannot bypass wake quotas', async t => {
+test('group continuation obeys wake quotas both inside and outside the observation window', async t => {
   const h=await bridgeHarness({config:{socialV2:{proactive:{enabled:false},wake:{observationMode:'background',preSleepWaitMs:300000,maxWakePerMinute:1}}}});
   t.after(()=>h.close());h.setMode('reserved2');const key='group:456',st=h.getSocialV2State(key);
   st.wakeConfig.observationMs=180000;st.wakeTimes=[Date.now()];st.lastAiReplyAt=Date.now()-181000;
   h.appendSocialV2Message(key,'fixture','hello','hello',false,false,'1',[],'123');
   await h.sendWakePromptV2(key,'continuation');assert.equal(h.calls.prompts.length,0);
-  st.lastAiReplyAt=Date.now()-179000;await h.sendWakePromptV2(key,'continuation');assert.equal(h.calls.prompts.length,1);
+  st.lastAiReplyAt=Date.now()-179000;await h.sendWakePromptV2(key,'continuation');assert.equal(h.calls.prompts.length,0);
+  st.wakeTimes=[];await h.sendWakePromptV2(key,'continuation');assert.equal(h.calls.prompts.length,1);
 });

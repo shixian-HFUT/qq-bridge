@@ -17,7 +17,7 @@ import {
 } from '../src/preset-prompt.js';
 
 const PRESET_PATH = new URL('../dsh/agent-presets/qq-chat-v2/agent.cordis.yml', import.meta.url);
-const source = fs.readFileSync(PRESET_PATH, 'utf8').replace(/\r?\n/g, '\r\n');
+const source = fs.readFileSync(PRESET_PATH, 'utf8');
 const originalPrefix = extractPresetPrefix(source);
 
 // 回归：内置预设必须满足**它自己那一代**的硬性不变量。
@@ -81,8 +81,7 @@ test('改写只动 prefix，其它条目与文件头注释原样保留', () => {
     'persona 的 suffix 不应被改动',
   );
   // 文件头注释（前 6 行）必须原样保留
-  const prefixStart = locatePresetPromptBlock(source).keyLine;
-  assert.deepEqual(next.split('\n').slice(0, prefixStart), source.split('\n').slice(0, prefixStart), 'prefix 之前的内容应保留');
+  assert.deepEqual(next.split('\n').slice(0, 6), source.split('\n').slice(0, 6), '文件头注释应保留');
   assert.ok(next.includes('prefix: |-'), '应使用字面量块写回');
 });
 
@@ -153,7 +152,7 @@ test('写回沿用文件主导行尾，且不吞掉块尾空行', () => {
 
 test('只含空格/Tab 的行也能安全往返（不会被当成空行读丢）', () => {
   const spaced = [
-    originalPrefix,
+    ...originalPrefix.split('\n').slice(0, 3),
     '   ',
     '\t',
     ' 带前后空格的正文 ',

@@ -15,18 +15,30 @@ import * as safeFetch from '../src/safe-fetch.js';
 import * as forward from '../src/forward.js';
 import * as slang from '../src/slang-learner.js';
 import * as sticker from '../src/sticker-lib.js';
+import * as mediaBatch from '../src/media-batch.js';
 import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import { isVoiceRequest, VoiceRequestStore, runVoiceAction } from '../src/voice-request.js';
 import * as voiceCadence from '../src/voice-cadence.js';
+import * as groupVoice from '../src/group-voice.js';
+import * as stickerCadence from '../src/sticker-cadence.js';
+import * as speechEmotion from '../src/speech-emotion.js';
 import { loadTtsConfig, validateSpeech } from '../src/aliyun-tts.js';
 import * as stateAcl from '../src/state-acl.mjs';
-import { inFlightTurnEvents } from '../src/in-flight-turns.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 import * as roleCard from '../src/role-card.js';
+import * as simpleTools from '../src/simple-tools.js';
+import * as privateFallback from '../src/private-fallback.js';
+import * as toolLoop from '../src/pi-tool-loop.js';
+import * as groupBudget from '../src/group-budget.js';
+import { createOwnerToolProvider } from '../src/dsh-owner-tools.js';
+import { memoryCaptureHint } from '../src/memory-capture-hint.js';
 import { MemoryStore, LONG_MEMORY_KINDS } from '../src/memory-store.js';
+import * as livingmemoryClient from '../src/livingmemory-client.js';
+import { exportLivingMemory } from '../src/livingmemory-export.js';
 import { ImageOutbox } from '../src/image-outbox.js';
+import { ImageCandidateCache, acceptableImageDimensions, candidateMatchesQuery } from '../src/image-candidates.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 export async function bridgeHarness({ config = {}, savedState, savedSocialState, globals = {} } = {}) {
@@ -46,6 +58,9 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
   const fakeFetch = async (url, init = {}) => {
     const body = (() => { try { return JSON.parse(init.body ?? '{}'); } catch { return init.body; } })();
     calls.http.push({ url: String(url), body });
+    // Sidecar fixture hook: tests pass globals.lmSidecar(url, init) to emulate the
+    // LivingMemory HTTP service with programmable auth/latency/failure behavior.
+    if (globals.lmSidecar && String(url).includes('/v1/')) return globals.lmSidecar(String(url), init);
     const action = String(url).split('/').pop();
     if (action === 'fetch_ptt_text') {
       return { ok: true, status: 200, json: async () => ({ status: 'ok', retcode: 0, data: { text: 'fixture-transcript' } }) };
@@ -111,12 +126,16 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
   source = source.slice(0, source.indexOf("process.on('SIGINT'"));
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
-    rebuildInFlightCollector, collectors, ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
+    ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, ensureWakeableV2, appendSocialV2Message, recordSentMessagesV2, longMemory, memoryContextV3,
+    livingMemory, flushLivingMemoryOutboxV3, buildLivingMemorySnapshotV3, runLivingMemoryReconcileV3,
+    archiveMemoryMessageV3, enqueueLivingMemoryIngestV3, kickLivingMemoryFlushV3, livingMemoryEpochV3,
+    applyLongMemoryV3, bumpLivingMemoryMutationV3,
     evaluateWakeTriggerV2, scheduleReplyCheckV2,
     pumpMux, pendingWakeKeys, wakeConfigMissCount,
-    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2, sendBudgetV2, deferQuotaWakeV2, coalesceGroupWakesV2, scheduleWakeV2,
+    buildPiTurnContextV2, sendPrivateMediaFallbackV2,
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
@@ -140,12 +159,14 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
     clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
-    discoverDshLaunchToken: () => '', unwrap, createTurnCollector, inFlightTurnEvents,
-    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ImageOutbox,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...roleCard,
+    discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
+    ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker, ImageOutbox, ImageCandidateCache, acceptableImageDimensions, candidateMatchesQuery,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...roleCard, ...simpleTools, ...privateFallback, ...toolLoop, ...mediaBatch, ...groupBudget,
+    createOwnerToolProvider, memoryCaptureHint,
     MemoryStore, LONG_MEMORY_KINDS,
+    ...livingmemoryClient, exportLivingMemory,
     LocalImages: class {}, // no local generation process in HTTP/flow fixtures
-    isVoiceRequest, VoiceRequestStore, runVoiceAction, loadTtsConfig, validateSpeech, ...voiceCadence,
+    isVoiceRequest, VoiceRequestStore, runVoiceAction, loadTtsConfig, validateSpeech, ...voiceCadence, ...groupVoice, ...stickerCadence, ...speechEmotion,
     synthesizeLocal: async () => { throw new Error('local TTS disabled in fixture'); },
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
@@ -183,7 +204,8 @@ export async function bridgeHarness({ config = {}, savedState, savedSocialState,
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
     for (const timer of timers) clearTimeout(timer);
+    bridge.livingMemory?.close?.();
     bridge.longMemory?.close();
-    fs.rmSync(temp, { recursive: true, force: true });
+    try { fs.rmSync(temp, { recursive: true, force: true, maxRetries: 8, retryDelay: 120 }); } catch { /* handle lag */ }
   } };
 }

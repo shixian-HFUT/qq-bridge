@@ -225,7 +225,7 @@ for (const rel of files) {
   // ② 内容级：一个文件里同一规则最多报 3 处（带行号），方便直接定位；不要把整文件刷屏。
   for (const rule of rules.deny) {
     let re;
-    try { re = new RegExp(rule.pattern, [...new Set((rule.flags || '') + 'g')].join('')); }
+    try { re = new RegExp(rule.pattern, rule.flags ?? 'g'); }
     catch (error) { console.error(`[privacy-scan] 规则「${rule.name}」正则非法：${error.message}`); continue; }
     re.lastIndex = 0;
     let m;
@@ -240,9 +240,6 @@ for (const rel of files) {
       const value = m[0];
       if (m.index === re.lastIndex) re.lastIndex += 1; // 空匹配保护
       if (isNoise(value, rule)) continue;
-      const lineText = text.slice(text.lastIndexOf('\n', m.index) + 1, text.indexOf('\n', m.index) < 0 ? text.length : text.indexOf('\n', m.index));
-      if (rule.requireNonHex && /^\s*"integrity"\s*:\s*"sha(?:256|384|512)-/.test(lineText)) continue;
-      if (rule.name.startsWith('疑似凭据赋值') && /[:=]\s*(?:process\.env\.|this\.)/.test(value)) continue;
       hits += 1;
       const line = text.slice(0, m.index).split('\n').length;
       findings.push({ kind: 'content', rule: rule.name, file: normalized, line, masked: mask(value) });
@@ -264,7 +261,6 @@ for (const rel of files) {
  * 真凭据是**混合大小写 + 数字**的高熵串，因此下面要求"同时含小写与大写与数字"。
  */
 function isNoise(value, rule) {
-  if (!rule.requireNonHex) return rule.name.startsWith('QQ 号') && ['123456789', '987654321', '2147483647', '4294967295'].includes(value);
   if (rule.requireNonHex && /^[0-9a-f]+$/i.test(value)) return true;
   if (/^[A-Z0-9_]+$/.test(value)) return true;                       // 环境变量名/常量
   if (/^[a-z0-9._-]+$/.test(value)) return true;                     // 文件名/包名/路径片段

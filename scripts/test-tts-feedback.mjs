@@ -5,10 +5,11 @@ import vm from 'node:vm';
 import { test } from 'node:test';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import { aliyunRequest } from '../src/aliyun-tts.js';
+import { SPEECH_EMOTIONS } from '../src/speech-emotion.js';
 
 async function fixture(t,{failure='synthesis'}={}) {
   let syntheses=0,sends=0;
-  const h=await bridgeHarness({config:{socialV2:{tools:{speak:true}}},globals:{
+  const h=await bridgeHarness({globals:{
     loadTtsConfig:()=>({enabled:true,approved:true,autonomous:true,roleName:'守岸人',maxChars:120}),
     synthesizeLocal:async root=>{syntheses++;if(failure==='synthesis')throw Error('阿里云语音请求失败或超时（ECONNRESET）');
       const file=path.join(root,'state','fixture.wav');fs.writeFileSync(file,Buffer.alloc(44));return{file,detail:{seconds:1}};},
@@ -53,7 +54,7 @@ test('actual MCP speech wrapper exposes safe failure cause and preserves unknown
   const start=source.indexOf("server.tool(\n  'qq_speak',"),end=source.indexOf('if (cfg.socialV2?.voice?.enabled',start);
   assert.ok(start>0&&end>start);
   let handler,known=true;const chain=new Proxy({},{get:()=>()=>chain});
-  const context=vm.createContext({server:{tool:(_n,_d,_s,fn)=>handler=fn},z:{string:()=>chain},serializeModelData:JSON.stringify,
+  const context=vm.createContext({server:{tool:(_n,_d,_s,fn)=>handler=fn},z:{string:()=>chain,enum:()=>chain},SPEECH_EMOTIONS,serializeModelData:JSON.stringify,
     agentApi:async()=>{const e=Error('阿里云语音请求失败或超时（ECONNRESET）');if(known){e.unknown=false;e.stage='synthesis';}throw e;}});
   vm.runInContext(source.slice(start,end),context);
   let result=JSON.parse((await handler({key:'group:456',token:'fixture',text:'你好'})).content[0].text);

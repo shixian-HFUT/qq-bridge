@@ -1,0 +1,62 @@
+# LINUX_CHECKS decision: the real bridge container runs with Docker network
+# mode "host", so the sidecar binds host loopback 127.0.0.1:8765 directly —
+# this matches the bridge baseUrl http://127.0.0.1:8765 and changes nothing
+# about the bridge's network membership or routes. (Do NOT use 0.0.0.0 with
+# host networking: it would expose the sidecar on external interfaces.)
+services:
+  livingmemory-sidecar:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: amiya/livingmemory-sidecar:0.1.0
+    container_name: livingmemory-sidecar
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      LM_MODE: production
+      LM_BIND: 127.0.0.1
+      LM_PORT: "8765"
+      LM_DATA_DIR: /srv/livingmemory/data
+      LM_CONFIG_FILE: /app/config/service.json
+      LM_BRIDGE_TOKEN_FILE: /run/secrets/lm_bridge_token
+      LM_OPERATOR_TOKEN_FILE: /run/secrets/lm_operator_token
+      LM_EMBEDDING_API_KEY_FILE: /run/secrets/lm_embedding_key
+      LM_LLM_API_KEY_FILE: /run/secrets/lm_llm_key
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    volumes:
+      # Docker initialises a fresh named volume root as root:root; before the
+      # very first start run:
+      #   docker volume create lm-data && sudo chown -R 10001:10001 \
+      #     "$(docker volume inspect -f '{{.Mountpoint}}' lm-data)"
+      - lm-data:/srv/livingmemory/data
+      - ../config/service.json:/app/config/service.json:ro
+    secrets:
+      - lm_bridge_token
+      - lm_operator_token
+      - lm_embedding_key
+      - lm_llm_key
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  lm-data:
+    name: lm-data
+
+secrets:
+  lm_bridge_token:
+    file: ./secrets/lm_bridge_token.txt
+  lm_operator_token:
+    file: ./secrets/lm_operator_token.txt
+  lm_embedding_key:
+    file: ./secrets/lm_embedding_key.txt
+  lm_llm_key:
+    file: ./secrets/lm_llm_key.txt

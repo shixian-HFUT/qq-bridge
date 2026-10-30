@@ -10,7 +10,7 @@ async function fixture(t, { failure, hold, maxPerHour = 10 } = {}) {
   let syntheses = 0, voices = 0, texts = 0, release;
   const gate = hold ? new Promise(resolve => { release = resolve; }) : null;
   const settings = { enabled: true, approved: true, autonomous: true, roleName: '守岸人', maxChars: 120 };
-  const h = await bridgeHarness({ config: { socialV2: { tools: { speak: true }, wake: { observationMode: 'background' }, voice: { maxPerHour } } }, globals: {
+  const h = await bridgeHarness({ config: { socialV2: { wake: { observationMode: 'background' }, voice: { maxPerHour } } }, globals: {
     loadTtsConfig: () => settings,
     synthesizeLocal: async root => {
       syntheses++;
@@ -57,6 +57,7 @@ test('four actual text sends are followed by one role voice, with read cursor an
   assert.equal(r.data.turnComplete, true); assert.equal(f.st.unread.length, 0);
   assert.deepEqual(f.counts(), { syntheses: 1, voices: 1, texts: 4 });
   assert.equal(f.st.voiceCadence.textTurns, 0);
+  assert.equal(f.st.stickerCadence.repliesWithoutSticker, 5);
   assert.equal(f.st.recentMessages.filter(m => m.speech).length, 1);
 });
 
@@ -117,6 +118,7 @@ test('concurrent copies of an automatic voice share synthesis and never produce 
   const second = f.send(text); await new Promise(resolve => setTimeout(resolve, 20)); f.release();
   const results = await Promise.all([first, second]); assert(results.every(r => r.data.delivery === 'voice'));
   assert.deepEqual(f.counts(), { syntheses: 1, voices: 1, texts: 0 });
+  assert.equal(f.st.stickerCadence.repliesWithoutSticker, 1);
 });
 
 test('voice cooldown and exhausted hourly voice budget keep ordinary replies working', async t => {

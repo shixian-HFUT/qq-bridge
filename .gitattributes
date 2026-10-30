@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.woff2 binary
+# Retain vendored upstream bytes for the checked source manifest.
+services/livingmemory/vendor/** -text

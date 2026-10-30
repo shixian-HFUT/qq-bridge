@@ -1,0 +1,16 @@
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/qqbot
+COPY package.json package-lock.json .npmrc ./
+COPY scripts/patch-snowluma-sdk.mjs scripts/patch-snowluma-sdk.mjs
+RUN npm ci --omit=dev --no-audit --no-fund
+COPY runtime/pi/package.json runtime/pi/package-lock.json runtime/pi/
+RUN npm --prefix runtime/pi ci --ignore-scripts --no-audit --no-fund
+COPY runtime/pi/sdk.js runtime/pi/sdk.js
+COPY src src
+COPY public public
+COPY plugins plugins
+COPY dsh dsh
+COPY roles roles
+ENV TZ=Asia/Shanghai
+CMD ["node", "src/bridge.js"]

@@ -539,10 +539,32 @@ const groupWithRoster = (over = {}) => st({
 }
 // ── 11. 可重放记录：文档锚点表逐条核对当前文件（t4）──────────────────────
 {
-  const guide = fs.readFileSync(path.join(ROOT, 'docs/guides/FORK_UPDATE_2026_10.md'), 'utf8');
-  assert(/sharedMemory/.test(guide) && /pendingThought/.test(guide), '公开指南说明共享域与私有待说内容');
-  for (const name of ['sharedMemoryConfigV2', 'sharedDomainAllowsV2', 'recordSharedSourceV2']) {
-    assert(src.includes(name), '共享记忆入口存在：' + name);
+  const REPLAY = path.join(ROOT, 'docs', 'guides', 'SHARED_MEMORY_REPLAY.md');
+  assert(fs.existsSync(REPLAY), '存在可重放记录 docs/guides/SHARED_MEMORY_REPLAY.md');
+  if (fs.existsSync(REPLAY)) {
+    const doc = fs.readFileSync(REPLAY, 'utf8');
+    const bridgeSrc = fs.readFileSync(BRIDGE, 'utf8');
+    // 取锚点表第三列（反引号包起来的那一列）：| # | 补丁点 | anchor |
+    // markdown 表格里要写 \| 才能显示竖线，取出来先还原成代码里的原样。
+    const anchors = [...doc.matchAll(/^\|\s*\d+\s*\|[^|]*\|\s*`([^`]+)`\s*\|/gm)]
+      .map((m) => m[1].replace(/\\\|/g, '|'));
+    assert(anchors.length >= 20, '锚点表至少 20 条（覆盖 7 处核心 + 依附改动）', anchors.length + ' 条');
+    const missing = anchors.filter((a) => !bridgeSrc.includes(a));
+    assert(missing.length === 0, '按记录核对：每个锚点都能在当前 src/bridge.js 原样找到',
+      missing.length ? '缺失：' + missing.join(' || ') : anchors.length + ' 条全部命中');
+    for (const b of ['before-sharedmemory-2026-10-04T12-11-23-984Z', 'before-memorysnapshots-2026-10-04T13-02-05-714Z']) {
+      assert(doc.includes(b), '记录里写明备份文件名 ' + b);
+    }
+    assert(/7 处改动|七处/.test(doc) && /重打/.test(doc), '记录写明 7 处改动与重打方式');
+    // t4 验收①：LOCAL_PATCHES.md / SHARED_MEMORY_PATCH.md 也要与当前文件匹配 ——
+    // 文档里提到的每个 xxxV2( 标识符都必须真的存在于 bridge.js（改名/删函数会让文档变谎话）。
+    for (const name of ['LOCAL_PATCHES.md', 'SHARED_MEMORY_PATCH.md']) {
+      const d = fs.readFileSync(path.join(ROOT, 'docs', 'guides', name), 'utf8');
+      const ids = [...new Set([...d.matchAll(/`([A-Za-z_][A-Za-z0-9_]*V2)\(/g)].map((m) => m[1]))];
+      const gone = ids.filter((idn) => !bridgeSrc.includes(idn));
+      assert(ids.length > 0 && gone.length === 0, name + ' 引用的函数都存在于当前 bridge.js',
+        gone.length ? '缺失：' + gone.join(', ') : ids.length + ' 个标识符全部命中');
+    }
   }
 }
 

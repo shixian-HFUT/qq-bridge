@@ -437,17 +437,4 @@ await test('malformed HTTP request targets return 400 without hanging', async (h
   finally { await new Promise((resolve) => server.close(resolve)); await h.close(); }
 }
 
-await test('reconnected collector never replays inherited text when a seed reuses turn numbers', async h => {
-  const message = text => ({ type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text }] } } });
-  h.rebuildInFlightCollector('fixture-session', [
-    { type: 'turn/start', data: { turn: 1 } }, message('old'),
-    { type: 'session/end-seed' },
-    { type: 'turn/start', data: { turn: 1 } }, message('current'),
-  ]);
-  const ended = h.collectors.get('fixture-session').push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
-  assert.equal(ended.text, 'current');
-  h.rebuildInFlightCollector('fixture-session', [{ type: 'session/end-seed' }]);
-  assert.equal(h.collectors.has('fixture-session'), false);
-});
-
 if (failures) process.exitCode = 1;

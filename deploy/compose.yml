@@ -1,0 +1,54 @@
+services:
+  bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.bridge
+    image: qq-bridge-amiya:local
+    restart: unless-stopped
+    network_mode: host
+    env_file: ../secrets/provider.env
+    volumes:
+      - ../config.json:/opt/qqbot/config.json:ro
+      - ../state:/opt/qqbot/state
+      - ../secrets:/opt/qqbot/secrets:ro
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+  livingmemory:
+    profiles: [memory]
+    build:
+      context: ../services/livingmemory
+      dockerfile: deploy/Dockerfile
+    image: qq-bridge-livingmemory:local
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      LM_MODE: production
+      LM_BIND: 127.0.0.1
+      LM_PORT: "8765"
+      LM_DATA_DIR: /srv/livingmemory/data
+      LM_CONFIG_FILE: /app/config/service.json
+      LM_BRIDGE_TOKEN_FILE: /run/secrets/lm_bridge_token.txt
+      LM_OPERATOR_TOKEN_FILE: /run/secrets/lm_operator_token.txt
+      LM_EMBEDDING_API_KEY_FILE: /run/secrets/lm_embedding_key.txt
+      LM_LLM_API_KEY_FILE: /run/secrets/lm_llm_key.txt
+      LM_LLM_MODEL: ${LM_LLM_MODEL:-glm-5.3-flash}
+    volumes:
+      - ../state/livingmemory:/srv/livingmemory/data
+      - ../services/livingmemory/config/service.json:/app/config/service.json:ro
+      - ../secrets:/run/secrets:ro
+    read_only: true
+    tmpfs:
+      - /srv/livingmemory/run:uid=10001,gid=10001,mode=0700
+      - /tmp:mode=1777
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

@@ -10,13 +10,12 @@ function loadWebTools(safeFetch) {
   const tools = new Map();
   const source = fs.readFileSync(new URL('../src/mcp-web-search-safe.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '')
-    .replaceAll('import.meta.url', JSON.stringify(new URL('../src/mcp-web-search-safe.js', import.meta.url).href))
     .replace('await server.connect(new StdioServerTransport());', 'server.connect(new StdioServerTransport());');
   class McpServer {
     tool(name, description, schema, callback) { tools.set(name, { schema, callback }); }
     connect() {}
   }
-  vm.runInNewContext(source, { safeFetch, configureSafeDns() {}, readWithSiteBrowser: async () => null, readableWebText: value => value.replace(/<[^>]+>/g, ' '), extractWebImages: () => [], fs: { readFileSync: () => '{}' }, path, fileURLToPath: url => new URL(url).pathname, McpServer, StdioServerTransport: class {}, z, URL });
+  vm.runInNewContext(source, { safeFetch, McpServer, StdioServerTransport: class {}, z, URL });
   return async (name, arguments_) => {
     const tool = tools.get(name);
     return tool.callback(z.object(tool.schema).parse(arguments_));

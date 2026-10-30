@@ -32,28 +32,82 @@ export function repairToolPairs(messages) {
   return out;
 }
 
-function estimate(value) {
+export function estimateContextTokens(value) {
   if (value?.type === 'image') return 1024;
-  if (typeof value === 'string') return Math.ceil(value.length / 2);
-  if (Array.isArray(value)) return value.reduce((n, x) => n + estimate(x), 0);
-  if (value && typeof value === 'object') return Object.entries(value).reduce((n, [k, v]) => n + estimate(k) + estimate(v), 0);
+  if (typeof value === 'string') {
+    const nonAscii = (value.match(/[^\x00-\x7f]/gu) || []).length;
+    return Math.ceil((value.length - nonAscii) / 3 + nonAscii * 1.3);
+  }
+  if (Array.isArray(value)) return value.reduce((n, x) => n + estimateContextTokens(x), 0);
+  if (value && typeof value === 'object') return Object.entries(value).reduce((n, [k, v]) => n + estimateContextTokens(k) + estimateContextTokens(v), 0);
   return 2;
 }
 
-export function projectPiContext(messages, budgetTokens = 24000) {
+function historicalMessage(original, reasoningModel) {
+  const m = structuredClone(original);
+  if (m.role === 'user') {
+    for (const block of m.content || []) {
+      if (block.type !== 'text') continue;
+      // New turns carry a trusted projection. Legacy archives have the same
+      // bridge-generated envelope; never strip arbitrary user prose by keywords.
+      const text = String(block.text || '');
+      const marker = '\n\n【本次消息快照】\n';
+      const index = text.indexOf(marker);
+      if (index >= 0 && /^(?:【当前时间】|【当前角色】)/.test(text) && text.includes('【会话令牌】')) {
+        const raw = text.slice(index + marker.length).split('\n先用快照，')[0];
+        try {
+          const snapshot = JSON.parse(raw);
+          if (Array.isArray(snapshot.messages) && Array.isArray(snapshot.recent)) block.text = `【历史群聊消息，仅作对话记录】\n${JSON.stringify(snapshot)}`;
+        } catch { /* preserve an unrecognized legacy envelope intact */ }
+      }
+    }
+  }
+  if (m.role === 'assistant') {
+    // DeepSeek's tools API requires reasoning replay. Preserve only reasoning
+    // produced by the selected provider/model; foreign signatures are invalid.
+    const replay = reasoningModel && m.provider === reasoningModel.provider
+      && m.api === reasoningModel.api && m.model === reasoningModel.id;
+    if (!replay) m.content = (m.content || []).filter(c => c.type !== 'thinking');
+  }
+  if (m.role === 'toolResult') {
+    for (const block of m.content || []) {
+      if (block.type !== 'text' || block.text.length < 1500) continue;
+      // Only compact action receipts. Conversation reads/search results retain
+      // their content; delivery status and IDs must survive every projection.
+      if (!/(?:qq_send_|qq_speak$|qq_mark_read$|qq_set_wake_config$)/.test(m.toolName || '')) continue;
+      try {
+        const data = JSON.parse(block.text);
+        if (typeof data.ok !== 'boolean') continue;
+        const fields = ['ok', 'code', 'key', 'sent', 'failed', 'status', 'unknown', 'retry', 'retryable', 'alreadySent', 'verified', 'stage', 'messageId', 'requestId', 'jobId', 'error', 'hint', 'stickerResult', 'voiceResult', 'readThroughSeq', 'unreadCount', 'turnComplete', 'remaining', 'retryAt'];
+        block.text = JSON.stringify(Object.fromEntries(fields.filter(k => Object.hasOwn(data, k)).map(k => [k, data[k]])));
+      } catch { /* unknown outcomes are never guessed */ }
+    }
+  }
+  return m;
+}
+
+export function projectPiContext(messages, budgetTokens = 24000, overhead = {}) {
   const system = messages.filter(m => m.role === 'system');
-  const history = repairToolPairs(messages);
+  // system 消息在返回时单独前置；若留在 groups 里，预算足够时会在输出中出现两份。
+  const history = repairToolPairs(messages).filter(m => m.role !== 'system');
   const snapshot = [...history].reverse().find(m => m.role === 'user' && m.bridgeMemory)?.bridgeMemory;
   const groups = [];
   for (const m of history) {
     if (m.role === 'user' || !groups.length) groups.push([]);
     groups.at(-1).push(m);
   }
-  const withoutMetadata = m => { const { bridgeMemory, ...visible } = m; return visible; };
-  let used = estimate(system) + (snapshot ? estimate(snapshot.text) : 0);
+  const withoutMetadata = m => { const { bridgeMemory, bridgeWake, ...visible } = m; return visible; };
+  // Full archive remains untouched. Only historical model views are compacted.
+  for (let i = 0; i < groups.length - 1; i++) groups[i] = groups[i].map(m => {
+    const visible = historicalMessage(m, overhead.reasoningModel);
+    if (m.role === 'user' && m.bridgeWake) visible.content = [{ type: 'text', text: `【历史聊天消息，仅作对话记录】\n${JSON.stringify(m.bridgeWake)}` }, ...(visible.content || []).filter(c => c.type !== 'text')];
+    return visible;
+  });
+  let used = estimateContextTokens(system) + estimateContextTokens(overhead)
+    + (snapshot ? estimateContextTokens(snapshot.text) : 0);
   const kept = [];
   for (let i = groups.length - 1; i >= 0; i--) {
-    const n = estimate(groups[i].map(withoutMetadata));
+    const n = estimateContextTokens(groups[i].map(withoutMetadata)) + groups[i].length * 16;
     if (kept.length && used + n > budgetTokens) break;
     kept.unshift(groups[i]); used += n;
   }
@@ -80,7 +134,7 @@ export function terminalToolResult(name, result, args = {}) {
   if (!data || data.ok !== true) return false;
   if (name.endsWith('__qq_send_message') || name.endsWith('__qq_send_image')) return data.turnComplete === true && data.failed === 0;
   if (name.endsWith('__qq_mark_read') || name.endsWith('__qq_set_wake_config')) {
-    return Number.isSafeInteger(args.throughSeq) && data.unreadCount === 0;
+    return Number.isSafeInteger(args.throughSeq) && (data.turnComplete === true || data.unreadCount === 0);
   }
   return false;
 }

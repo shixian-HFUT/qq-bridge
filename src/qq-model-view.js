@@ -3,7 +3,7 @@
 import { maskModelText, safeModelDisplayName } from './model-safety.js';
 
 const DEFAULT_FALSE_FIELDS = new Set([
-  'quoteTargetIsSelf', 'isOwner', 'isSelf', 'hasMedia', 'hasForward'
+  'quoteTargetIsSelf', 'directedToYou', 'isOwner', 'isSelf', 'hasMedia', 'hasForward'
 ]);
 const OPTIONAL_FIELDS = new Set([
   'seq', 'messageId', 'sender', 'userId', 'text', 'plain', 'tail', 'kind',

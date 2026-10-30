@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
+const SERVER = 'http://127.0.0.1:8188';
+const OUTPUT = 'D:/Ai_video/ComfyUI/output';
+const TEMPLATE = 'D:/Ai_video/生图模型部署/api_61_QwenImage21_文生图_int8快速版.json';
 export class LocalImages {
-  constructor(root, config = {}) {
-    this.config = config;
-    this.root = root;
+  constructor(root) {
     this.dir = path.join(root, 'state', 'image-jobs');
     fs.mkdirSync(this.dir, { recursive: true });
     this.file = path.join(this.dir, 'jobs.json');
@@ -13,23 +14,14 @@ export class LocalImages {
     this.submitting = false;
   }
   save() { fs.writeFileSync(this.file + '.pending', JSON.stringify(this.jobs, null, 2)); fs.renameSync(this.file + '.pending', this.file); }
-  settings() {
-    if (this.config.enabled !== true || !this.config.outputDir || !this.config.templateFile) throw Error('本地生图未配置；请管理员设置 imageGeneration');
-    const server = new URL(this.config.server || 'http://127.0.0.1:8188');
-    if (server.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(server.hostname)
-      || server.username || server.password || server.pathname !== '/' || server.search || server.hash) throw Error('ComfyUI只允许无凭据的本机HTTP地址');
-    return { server: server.origin, output: path.resolve(this.root, this.config.outputDir), template: path.resolve(this.root, this.config.templateFile) };
-  }
   async api(route, body) {
-    const { server } = this.settings();
-    const r = await fetch(server + route, { method: body ? 'POST' : 'GET', redirect: 'error', headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(body ? 120000 : 10000) });
+    const r = await fetch(SERVER + route, { method: body ? 'POST' : 'GET', headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(body ? 120000 : 10000) });
     const data = await r.json();
     if (!r.ok || data.error) throw Error('ComfyUI 请求失败：' + JSON.stringify(data.error || r.status).slice(0, 300));
     return data;
   }
   get(key, id) { const job = this.jobs[id]; if (!job || job.key !== key) throw Error('没有当前会话的该生图任务'); return job; }
   async submit(key, input) {
-    const { template } = this.settings();
     const prompt = String(input.prompt || '').trim();
     if (!prompt || prompt.length > 6000) throw Error('生图提示词限1～6000字');
     const width = Number(input.width || 1024), height = Number(input.height || 1024);
@@ -46,7 +38,7 @@ export class LocalImages {
       const uncertain = Object.values(this.jobs).find(j => ['submitting', 'unknown'].includes(j.status));
       if (uncertain) throw Error('存在提交结果不明的任务，请管理端核对后再提交');
       const job = { id, key, requestId, prompt, width, height, seed: crypto.randomInt(0, 2147483647), status: 'submitting', createdAt: Date.now() };
-      const graph = JSON.parse(fs.readFileSync(template, 'utf8'));
+      const graph = JSON.parse(fs.readFileSync(TEMPLATE, 'utf8'));
       graph['4'].inputs.prompt = prompt;
       graph['5'].inputs.width = width; graph['5'].inputs.height = height;
       Object.assign(graph['6'].inputs, { steps: 25, cfg: 1, sampler_name: 'euler', scheduler: 'simple', seed: job.seed });
@@ -64,7 +56,6 @@ export class LocalImages {
   }
   public(j) { return { jobId: j.id, promptId: j.promptId, status: j.status, width: j.width, height: j.height, sent: j.sendStatus, messageId: j.messageId, error: j.error }; }
   async query(key, id) {
-    const { output } = this.settings();
     const j = this.get(key, id);
     if (!j.promptId && ['unknown', 'submitting'].includes(j.status)) {
       // Recover a lost submit response by the stable ComfyUI client_id, never resubmit.
@@ -83,10 +74,10 @@ export class LocalImages {
         const images = Object.values(h.outputs || {}).flatMap(o => o.images || []).filter(i => i.type === 'output');
         const img = images[0];
         if (img) {
-          const file = path.resolve(output, img.subfolder || '', img.filename);
-          const relative = path.relative(output, file);
+          const file = path.resolve(OUTPUT, img.subfolder || '', img.filename);
+          const relative = path.relative(path.resolve(OUTPUT), file);
           if (relative.startsWith('..') || path.isAbsolute(relative) || !file.toLowerCase().endsWith('.png')) throw Error('非法生成结果路径');
-          const real = fs.realpathSync(file), realRelative = path.relative(fs.realpathSync(output), real);
+          const real = fs.realpathSync(file), realRelative = path.relative(fs.realpathSync(OUTPUT), real);
           if (realRelative.startsWith('..') || path.isAbsolute(realRelative)) throw Error('生成结果不在输出目录');
           j.output = real; j.status = 'completed';
         }

@@ -194,7 +194,7 @@ function validateLimit(value, name) {
 
 // 使用已校验的 IP 发起请求，保留原始 Host/SNI，禁止重新解析 DNS。
 // 总时限包含 TCP/TLS、响应头和响应体；仅 socket idle timeout 无法阻止慢速滴流。
-function requestOnce(url, ip, limit, binary = false, headers = {}) {
+function requestOnce(url, ip, limit, binary = false, headers = {}, signal) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let req;
@@ -203,6 +203,7 @@ function requestOnce(url, ip, limit, binary = false, headers = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
       if (error) reject(error);
       else resolve(result);
     };
@@ -212,6 +213,12 @@ function requestOnce(url, ip, limit, binary = false, headers = {}) {
       req?.destroy(error);
       response?.destroy();
     }, REQUEST_TIMEOUT_MS);
+    const abort = () => {
+      const error = signal.reason || new Error('图片预检超时');
+      finish(error); req?.destroy(error); response?.destroy();
+    };
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener('abort', abort, { once: true });
     const mod = url.protocol === 'https:' ? https : http;
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
     try {
@@ -349,12 +356,19 @@ export async function safeFetchAudioBuffer(urlString, maxBytes, allowUrl) {
 }
 
 /** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024) {
+export async function safeFetchBuffer(urlString, maxBytes = 10 * 1024 * 1024, { timeoutMs, signal } = {}) {
   validateLimit(maxBytes, 'maxBytes');
+  if (timeoutMs !== undefined) {
+    validateLimit(timeoutMs, 'timeoutMs');
+    const deadline = AbortSignal.timeout(timeoutMs);
+    signal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  }
+  signal?.throwIfAborted();
   const MAX_REDIRECTS = 5;
   let { url, ip } = await validateFetchUrl(urlString);
   let resized = false;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    signal?.throwIfAborted();
     // Public Sina image CDN expects ordinary browser hotlink headers. Derive
     // them from an exact known CDN hostname; never forward caller headers or
     // carry a referrer to an unrelated redirect destination.
@@ -379,7 +393,7 @@ export async function safeFetchBuffer(urlString, maxBytes = 4 * 1024 * 1024) {
       headers = { 'user-agent': 'qqbot-image/1.0' };
     }
     let result;
-    try { result = await requestOnce(url, ip, maxBytes, true, headers); }
+    try { signal?.throwIfAborted(); result = await requestOnce(url, ip, maxBytes, true, headers, signal); }
     catch (error) {
       // Use the CDN's public resized variant once, retaining the same image ID
       // and the existing byte/pixel restrictions. No change for other sites.

@@ -1,0 +1,20 @@
+# Exact versions VERIFIED by the real-engine test suite on 2026-10-29
+# (Python 3.12.9, Windows, .uv-tools/astrbot environment; deterministic
+# providers, FAISS 1.15.1 IndexIDMap smoke + full pytest pass).
+# Deployment installs from this file; upgrades happen only via a deliberate
+# re-run of the suite (INTEGRATION_GAPS item 3) — never silent drift.
+astrbot==4.29.3
+faiss-cpu==1.15.1
+numpy==2.5.4
+aiosqlite==0.22.1
+jieba==0.42.1
+networkx==3.7
+pytz==2026.5
+aiofiles==25.1.0
+sqlmodel==0.0.48
+SQLAlchemy==2.1.6
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn==0.54.0
+httpx==0.28.1
+pydantic==2.14.1
