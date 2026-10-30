@@ -1,5 +1,7 @@
 # QQ ↔ DeepSeek Harness 桥接
 
+> **独立长期记忆服务：** 主分支新增 LivingMemory 服务、中文管理页、API 契约和离线回归。见 [部署与接入说明](docs/guides/LIVINGMEMORY_SERVICE.md)。完整 QQ 适配与阿米娅配置仍在 `codex/amiya-production`。
+
 **English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
 
 > 本 fork **v0.3.1** 在可选 Pi 后端上增加有来源的长期记忆、图片检索与发送去重、群聊身份和后台观察、可选语音与稳定性修复。DSH 仍为默认后端。更新范围、配置、共享记忆边界与离线检查见 [本次更新说明](docs/guides/FORK_UPDATE_2026_10.md)；Pi 安装与迁移见 [Pi 后端说明](docs/guides/PI_BACKEND.md)。

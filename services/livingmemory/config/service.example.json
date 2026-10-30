@@ -1,0 +1,49 @@
+{
+  "mode": "production — set via LM_MODE env, this file carries non-secret defaults",
+  "dataDir": "/srv/livingmemory/data",
+  "bind": "127.0.0.1",
+  "port": 8765,
+  "personaId": "qq-bot",
+  "botUserId": "CHANGE_ME_bot_qq_number",
+  "embedding": {
+    "kind": "openai-compatible",
+    "_comment": "Example OpenAI-compatible embedding model, dim 1536. Match dim to the model and rebuild the index if it changes. Credentials use LM_EMBEDDING_API_KEY_FILE.",
+    "baseUrl": "https://api.apib.ai/v1",
+    "baseUrlEnv": "LM_EMBEDDING_BASE_URL",
+    "model": "text-embedding-3-small",
+    "modelEnv": "LM_EMBEDDING_MODEL",
+    "apiKeyFileEnv": "LM_EMBEDDING_API_KEY_FILE",
+    "dim": 1536,
+    "timeoutSeconds": 30
+  },
+  "llm": {
+    "kind": "openai-compatible",
+    "_comment": "Configure the chat model and endpoint for your own host. Credentials use LM_LLM_API_KEY_FILE.",
+    "baseUrl": "https://api.apib.ai/v1",
+    "baseUrlEnv": "LM_LLM_BASE_URL",
+    "model": "REPLACE_WITH_BRIDGE_CHAT_MODEL",
+    "modelEnv": "LM_LLM_MODEL",
+    "apiKeyFileEnv": "LM_LLM_API_KEY_FILE",
+    "timeoutSeconds": 60,
+    "maxOutputTokens": 1024
+  },
+  "limits": {
+    "bodyMaxBytes": 2097152,
+    "ingestTextMaxChars": 32000,
+    "recallQueryMaxChars": 2000,
+    "kMax": 12,
+    "recallMaxChars": 1600
+  },
+  "reflection": {
+    "triggerMessages": 20,
+    "quietSeconds": 600,
+    "chunkMessages": 60,
+    "maxWindowChars": 12000,
+    "dailyLlmCalls": 2,
+    "decayIntervalSeconds": 3600
+  },
+  "sharedIdentity": {
+    "enabled": false
+  },
+  "engine": {}
+}

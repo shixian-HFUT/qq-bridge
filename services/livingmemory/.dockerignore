@@ -1,0 +1,7 @@
+data
+.test-tmp
+.pytest_cache
+**/__pycache__
+**/*.pyc
+config/service.json
+deploy/secrets

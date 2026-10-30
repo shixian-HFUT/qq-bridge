@@ -1,0 +1,14 @@
+# Host/runtime requirements for the LivingMemory sidecar.
+#
+# The engine (vendored LivingMemory 2.8.2) imports AstrBot libraries; reuse
+# an existing AstrBot 4.24+ install for local deterministic tests — tests run
+# against `.uv-tools/astrbot` (astrbot 4.29.3) WITHOUT modifying it.
+#
+# Deployment MUST install requirements.lock.txt (exact versions verified by
+# the passing suite) rather than floating floors:
+#     pip install -r requirements.lock.txt
+# Upgrades are a deliberate process: bump the lock, re-run pytest + the real
+# uvicorn boot test, only then promote (INTEGRATION_GAPS item 3).
+#
+# Windows note (INTEGRATION_GAPS item 4): always run with UTF-8 stdio,
+# e.g. `python -X utf8 -m sidecar`, or set PYTHONUTF8=1 / PYTHONIOENCODING=utf-8.

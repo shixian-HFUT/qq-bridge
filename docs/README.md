@@ -1,3 +1,5 @@
+> **独立记忆组件：** [LivingMemory 服务说明](guides/LIVINGMEMORY_SERVICE.md)，包含 API、部署、来源、测试与数据边界。
+
 # 文档索引（docs/README.md）
 
 > 根目录只留 `README.md` / `README.en.md` / `RULES.md` 三个文档，其余全部在本目录下。

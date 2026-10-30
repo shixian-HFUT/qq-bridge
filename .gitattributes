@@ -1,0 +1,2 @@
+# Retain the pinned upstream source bytes used by VENDOR_MANIFEST.json.
+services/livingmemory/vendor/** -text
